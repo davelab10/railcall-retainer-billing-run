@@ -81,27 +81,49 @@ from Stripe.** `stripe_charge_create` refuses any `amount_cents` above 10000
 before it makes a request. A client row above $100 fails locally, not mid
 batch on Stripe's side.
 
-**`capabilities.max_spend_cents` is not enforced by the platform for a node
-inside a `for_each`.** RailCall's workflow staging plans a looped node once,
-with no item in scope, so its declared spend always comes out to 0 cents at
-staging time and the platform's own capability check never sees the real
-batch total. Whatever number sits in `capabilities.max_spend_cents`, that
-check passes for this workflow every time, because it is comparing against a
-spend figure that is always 0. This workflow does not rely on that check.
-`plan_summary` totals the real batch and sets a `proceed` flag, and the
-`charge` node's `cond` gates on that flag, so the ceiling that actually stops
-a run is `context.spend_ceiling_cents`, a separate field in a separate block,
-read directly by this workflow's own logic and enforced at run time before
-the first charge fires. It has a different name from `capabilities.max_spend_cents`
-on purpose: two spend fields with the same name, one inert and one enforced,
-is exactly the kind of trap that costs a buyer real money the first time they
-edit the wrong one. This is what the second test result above demonstrates.
+**`capabilities.max_spend_cents` still tells a staging reviewer nothing
+useful for a node inside a `for_each`, as of station v0.28.** Staging plans a
+looped node once, with no item in scope, so the plan output shows this
+workflow's `charge` node as `for_each_unbounded` and its declared spend still
+resolves to 0 cents at staging time. Station v0.28 did add a real platform
+side guard at run time: if `capabilities.max_spend_cents` is declared, the
+engine now tracks cumulative spend across a `for_each` and raises
+`SpendCapExceeded`, rolling back the whole run, once an iteration would push
+spend past that ceiling. This workflow keeps its own gate anyway, belt and
+suspenders: it enforces its own cap via `context.spend_ceiling_cents`
+regardless of the platform's `capabilities.max_spend_cents` check, so a
+v0.27-or-older station running this workflow is still safe, and even on
+v0.28 or later the result reads as a clean, whole run refusal (`charge`
+skipped, `reconcile` explains why) rather than a rollback with an exception
+partway through the batch. `context.spend_ceiling_cents` has a different name
+from `capabilities.max_spend_cents` on purpose: two spend fields with the
+same name, one platform enforced and one workflow enforced, is exactly the
+kind of trap that costs a buyer real money the first time they edit the
+wrong one. See TESTING.md for both results side by side.
 
 **`for_each` and `cond` are only evaluated when the workflow runs, not during
 staging.** A binding typo in either field passes staging with no warning and
 only breaks, or silently does nothing, once the workflow actually runs. If
 you edit the `charge` node, test the change with a live run against Stripe
 test mode, not just a stage.
+
+**There is no bridge between RailCall's module system and its workflow
+system, checked again against station v0.28.** A workflow effect node
+resolves only through `integration_registry.py`, a table separate from the
+module runtime's `LOCAL_HANDLERS` and command registry, so a RailCall module
+command such as `stripe.billing.invoice_create` is not reachable from a
+workflow node. If a spec sets a module command id as `action_id` anyway,
+`resolve_node` does not fail cleanly: it falls back silently to the
+provider's first registered action and only errors downstream with a
+confusing `TypeError`, so do not assume an unrecognized `action_id` will
+fail loudly.
+
+## Testing
+
+See [TESTING.md](TESTING.md) for the actual commands run and their real
+output: the success path with a real Stripe test mode PaymentIntent, this
+workflow's own spend ceiling blocking a run with zero calls to Stripe, a row
+with no customer id being rejected, and a duplicate row being caught.
 
 ## License
 
