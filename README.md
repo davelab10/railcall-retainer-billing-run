@@ -17,7 +17,7 @@ reconcile.
   the platform itself enforces the declared spend ceiling natively.
 - reconcile compares what was intended against what actually landed.
 
-Demo video: https://youtu.be/YUN5aaUmDoc
+Demo video: https://youtu.be/jHipCIVVhqI
 
 ## Install
 
