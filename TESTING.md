@@ -4,15 +4,17 @@ Every result below is real output from running the published v1.0.2 spec.json
 through RailCall's own workflow engine (the same plan_workflow / run_workflow
 functions `railcall market stage` and `railcall market apply` call into),
 against Stripe test mode. Nothing here is a description of intended
-behavior. Last run against station v0.40, with the platform's native
+behavior. Last run against station v0.42, with the platform's native
 `capabilities.max_spend_cents` guard (landed v0.39) doing the enforcement.
 The workflow's own `cond` gate on the charge node, used through v1.0.1, has
-been removed.
+been removed. As of v1.2.0 the charge node uses `stripe_billing_bill_client`
+from the `dave/stripe-invoicing` module instead of the built-in
+`stripe_charge_create` primitive.
 
 ## 1. Success path, a real Stripe test mode PaymentIntent
 
 Five rows in context.clients: two valid and distinct, one duplicate of the
-first, one with no customer id, one with a zero amount. One charge should
+first, one with no email, one with a zero amount. One charge should
 survive validate and dedup.
 
 Command run:
@@ -70,28 +72,28 @@ The v1.0.2 platform-only guard produces `ROLLED_BACK` with the reason in the
 receipt's `error` field instead. Both stop the batch before it overspends;
 only the audit trail's shape changed.
 
-## 3. A row with no customer id is rejected
+## 3. A row with no email is rejected
 
-Row `{ "customer_id": "", "amount_cents": 8400 }` from the same batch above.
+Row `{ "email": "", "amount_cents": 8400 }` from the same batch above.
 
 Output, from the validate node:
 
 ```
-{ "row": { "customer_id": "", "amount_cents": 8400 }, "reason": "missing_customer_id" }
+{ "row": { "email": "", "amount_cents": 8400 }, "reason": "missing_email" }
 ```
 
 The row never reaches dedup or charge.
 
 ## 4. A duplicate row is detected
 
-Row `{ "customer_id": "cus_example001", "amount_cents": 7900 }` appears
+Row `{ "email": "client001@example.com", "amount_cents": 7900 }` appears
 twice in the same batch. validate passes both through since both are
 individually well formed. dedup catches the second occurrence.
 
 Output, from the dedup node:
 
 ```
-{ "customer_id": "cus_example001", "amount_cents": 7900, "reason": "duplicate_in_export" }
+{ "email": "client001@example.com", "amount_cents": 7900, "reason": "duplicate_in_export" }
 ```
 
 The same batch also carries a client already present in
@@ -99,5 +101,5 @@ context.already_billed for the period, which dedup catches with a second,
 distinct reason:
 
 ```
-{ "customer_id": "cus_example002", "amount_cents": 9500, "reason": "already_billed_this_period" }
+{ "email": "client002@example.com", "amount_cents": 9500, "reason": "already_billed_this_period" }
 ```
