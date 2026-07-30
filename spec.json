@@ -1,0 +1,70 @@
+{
+  "id": "dave/retainer-billing-run",
+  "title": "Retainer Billing Run",
+  "category": "Finance",
+  "description": "Monthly retainer billing for an agency or small SaaS with a fixed client list. Replace context.clients, context.already_billed, context.billing_period, and context.spend_ceiling_cents with your own data before running. The values shipped here are anonymous placeholder examples only, never real client data or a real Stripe account. validate rejects rows with no customer id, no amount, or a non-positive amount. dedup removes a client that appears twice in one export and a client already present in already_billed for this period, since the failure that actually hurts a retainer run is billing twice. Every charge is capped at $100 by RailCall's own stripe_charge_create primitive, not by Stripe itself, and that ceiling is enforced locally before any request reaches Stripe, so an oversized row fails fast instead of mid batch. Updated for station v0.41, re-verified directly against this spec rather than assumed from an older check. Station v0.41 exposes module commands in the Studio canvas palette as workflow nodes; this workflow uses the built-in stripe_charge_create primitive directly rather than the dave/stripe-invoicing module command, since module action_ids are not yet addressable from workflow spec JSON in v0.41. Workflow staging still plans a for_each node once without fanning it out, so this workflow's charge node reports as for_each_unbounded in the staged plan and its declared spend still resolves to 0 cents at staging time, unhelpful for a reviewer trying to judge the real batch total before approving. As of station v0.39, capabilities.max_spend_cents is enforced natively at run time for a for_each'd effect node: the engine tracks cumulative spend across iterations, reading each iteration's actual spend from the node's receipt first, then its resolved output, then a re-estimate of the args, whichever is highest, and raises SpendCapExceeded to roll back the whole run once an iteration would push spend past the declared ceiling. This workflow no longer carries its own cond gate on the charge node. The platform guard verified above is what stops an over budget batch now. context.spend_ceiling_cents and plan_summary's proceed flag stay in the spec and still total the real planned spend for the reconcile report, but they are informational only, not a gate; capabilities.max_spend_cents is the number that actually stops a charge. If the platform ever refuses a batch, the whole run rolls back with SpendCapExceeded in the workflow receipt's error field, not a clean skip with a reconcile summary, since the block happens before reconcile ever runs. Engine note on modules, re-checked against station v0.28 by grepping integration_registry.py for LOCAL_HANDLERS and cmdreg and by running a live probe, not assumed from an older session: there is still no bridge between the module system and the workflow system. A workflow effect node resolves only through integration_registry.py, a separate table from the module runtime's LOCAL_HANDLERS and command registry, so a RailCall module command such as stripe.billing.invoice_create is not reachable from a workflow node. Setting a module command id as action_id does not fail cleanly either: resolve_node falls back silently to the provider's first registered action and only errors downstream with a confusing TypeError, so an editor should not assume an unrecognized action_id will fail loudly. Engine note for anyone editing this spec: for_each and cond are only evaluated when the workflow actually runs, not during staging, so a binding typo in either field (for example nodes.dedup.output.clean instead of the one supported nodes.dedup.clean) passes staging with no warning and only breaks, or silently produces nothing, once the workflow runs for real. Test any change to the charge node with a live run, not just a stage. contest:2026Q3",
+  "homepage": "https://davelab10.github.io/portofolio/",
+  "tests_url": "https://github.com/davelab10/railcall-retainer-billing-run/blob/main/TESTING.md",
+  "context": {
+    "clients": [
+      { "customer_id": "cus_example001", "amount_cents": 7900 },
+      { "customer_id": "cus_example002", "amount_cents": 9500 },
+      { "customer_id": "cus_example001", "amount_cents": 7900 },
+      { "customer_id": "", "amount_cents": 8400 },
+      { "customer_id": "cus_example003", "amount_cents": 0 }
+    ],
+    "already_billed": ["cus_example002"],
+    "billing_period": "2026-07",
+    "spend_ceiling_cents": 50000
+  },
+  "capabilities": {
+    "providers": ["stripe"],
+    "max_spend_cents": 50000,
+    "allow_irreversible": false
+  },
+  "nodes": [
+    {
+      "id": "validate",
+      "type": "transform",
+      "input_from": "{{ctx.clients}}",
+      "code": "def is_valid_amount(v):\n    if isinstance(v, bool):\n        return False\n    if not isinstance(v, int):\n        return False\n    return v > 0\n\nbillable = []\nrejected = []\nrows = input if isinstance(input, list) else []\nfor row in rows:\n    if not isinstance(row, dict):\n        rejected.append({\"row\": row, \"reason\": \"not_an_object\"})\n        continue\n    cid = row.get(\"customer_id\")\n    amt = row.get(\"amount_cents\")\n    if not cid:\n        rejected.append({\"row\": row, \"reason\": \"missing_customer_id\"})\n        continue\n    if amt is None:\n        rejected.append({\"row\": row, \"reason\": \"missing_amount\"})\n        continue\n    if not is_valid_amount(amt):\n        rejected.append({\"row\": row, \"reason\": \"invalid_amount\"})\n        continue\n    billable.append({\"customer_id\": cid, \"amount_cents\": amt})\noutput = {\"billable\": billable, \"rejected\": rejected}"
+    },
+    {
+      "id": "dedup",
+      "type": "transform",
+      "input_from": {
+        "validate_output": "{{nodes.validate.output}}",
+        "already_billed": "{{ctx.already_billed}}",
+        "period": "{{ctx.billing_period}}"
+      },
+      "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nseen = set()\nalready = set(input.get(\"already_billed\") or [])\nperiod = input.get(\"period\") or \"\"\nclean = []\nskipped = []\nfor row in billable:\n    cid = row.get(\"customer_id\")\n    amt = row.get(\"amount_cents\")\n    if cid in seen:\n        skipped.append({\"customer_id\": cid, \"amount_cents\": amt, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(cid)\n    if cid in already:\n        skipped.append({\"customer_id\": cid, \"amount_cents\": amt, \"reason\": \"already_billed_this_period\"})\n        continue\n    desc = \"Retainer \" + str(cid) + \" \" + str(period)\n    clean.append({\"amount_cents\": amt, \"currency\": \"usd\", \"description\": desc})\noutput = {\"clean\": clean, \"skipped\": skipped}"
+    },
+    {
+      "id": "plan_summary",
+      "type": "transform",
+      "input_from": {
+        "dedup_output": "{{nodes.dedup.output}}",
+        "validate_output": "{{nodes.validate.output}}",
+        "spend_ceiling_cents": "{{ctx.spend_ceiling_cents}}"
+      },
+      "code": "do = input.get(\"dedup_output\") or {}\nvo = input.get(\"validate_output\") or {}\nclean = do.get(\"clean\") or []\nskipped = do.get(\"skipped\") or []\nrejected = vo.get(\"rejected\") or []\ntotal_cents = sum(int(c.get(\"amount_cents\") or 0) for c in clean)\nceiling = input.get(\"spend_ceiling_cents\")\nwithin_cap = isinstance(ceiling, int) and not isinstance(ceiling, bool) and total_cents <= ceiling\nhas_billable = len(clean) > 0\noutput = {\n    \"billable_count\": len(clean),\n    \"skipped_count\": len(skipped),\n    \"rejected_count\": len(rejected),\n    \"total_cents\": total_cents,\n    \"spend_ceiling_cents\": ceiling,\n    \"within_cap\": within_cap,\n    \"proceed\": has_billable and within_cap,\n}"
+    },
+    {
+      "id": "charge",
+      "type": "effect",
+      "action_id": "stripe_charge_create",
+      "for_each": "{{nodes.dedup.clean}}",
+      "args": "{{ctx.item}}",
+      "retry": { "max": 3, "backoff_s": 2 }
+    },
+    {
+      "id": "reconcile",
+      "type": "transform",
+      "input_from": {
+        "charge_output": "{{nodes.charge}}",
+        "plan_summary_output": "{{nodes.plan_summary.output}}"
+      },
+      "code": "ps = input.get(\"plan_summary_output\") or {}\nproceed = bool(ps.get(\"proceed\"))\nintended = ps.get(\"billable_count\") or 0\ncharge_out = input.get(\"charge_output\") or {}\nraw_items = charge_out.get(\"items\")\nif isinstance(raw_items, list):\n    items = raw_items\nelif charge_out.get(\"id\"):\n    items = [charge_out]\nelse:\n    items = []\nlanded_items = [it for it in items if it.get(\"id\")]\nlanded = len(landed_items)\nstatuses = sorted(set(str(it.get(\"status\")) for it in landed_items))\noutput = {\n    \"intended\": intended,\n    \"landed\": landed,\n    \"difference\": intended - landed,\n    \"blocked_by_cap\": (not proceed) and intended > 0,\n    \"total_planned_cents\": ps.get(\"total_cents\") or 0,\n    \"statuses_seen\": statuses,\n}"
+    }
+  ]
+}
