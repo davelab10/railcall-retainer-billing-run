@@ -2,7 +2,7 @@
   "id": "dave/retainer-billing-run",
   "title": "Retainer Billing Run",
   "category": "Finance",
-  "description": "Monthly retainer billing for an agency or small SaaS with a fixed client list. Replace context.clients, context.already_billed, context.billing_period, and context.spend_ceiling_cents with your own data before running. The values shipped here are anonymous placeholder examples only, never real client data or a real Stripe account. validate rejects rows with no email, no amount, or a non-positive amount. dedup removes a client that appears twice in one export and a client already present in already_billed for this period, since the failure that actually hurts a retainer run is billing twice. Updated for station v0.42. As of station v0.42, installed module commands are exposed as first-class workflow effect nodes via the integration_registry mirror (action_id format: provider_verb). This workflow now uses stripe_billing_bill_client from dave/stripe-invoicing instead of the built-in stripe_charge_create primitive. bill_client is composite: find-or-create customer, draft invoice, finalize, and send, four Stripe calls behind one airlock approval, with a Stripe Idempotency-Key derived from the payload hash on every write. As of station v0.39, capabilities.max_spend_cents is enforced natively at run time for a for_each effect node. This workflow no longer carries its own cond gate. context.spend_ceiling_cents and plan_summary's proceed flag are informational only. contest:2026Q3",
+  "description": "Monthly retainer billing for an agency or small SaaS with a fixed client list. Updated for station v0.45. Five nodes: validate rejects bad rows, dedup removes duplicates and already-billed clients, plan_summary totals planned spend, charge calls stripe_billing_bill_client from dave/stripe-invoicing, reconcile reports intended vs landed. AI companion commands from the same module: use stripe_billing_invoice_description_generate before the run to generate professional invoice descriptions, stripe_billing_dunning_message_draft for overdue follow-ups, stripe_billing_client_summary_insight for account reviews. All AI calls are governed via station.llm with signed egress receipts. As of station v0.39, capabilities.max_spend_cents is enforced natively. contest:2026Q3",
   "homepage": "https://davelab10.github.io/portofolio/",
   "tests_url": "https://github.com/davelab10/railcall-retainer-billing-run/blob/main/TESTING.md",
   "edges": [
@@ -59,7 +59,8 @@
   },
   "capabilities": {
     "providers": [
-      "stripe"
+      "stripe",
+      "groq"
     ],
     "max_spend_cents": 50000,
     "allow_irreversible": true
@@ -79,7 +80,7 @@
         "already_billed": "{{ctx.already_billed}}",
         "period": "{{ctx.billing_period}}"
       },
-      "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nseen = set()\nalready = set(input.get(\"already_billed\") or [])\nperiod = input.get(\"period\") or \"\"\nclean = []\nskipped = []\nfor row in billable:\n    email = row.get(\"email\")\n    amt = row.get(\"amount_cents\")\n    if email in seen:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(email)\n    if email in already:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"already_billed_this_period\"})\n        continue\n    desc = \"Retainer \" + str(period)\n    clean.append({\"email\": email, \"amount_cents\": amt, \"description\": desc})\noutput = {\"clean\": clean, \"skipped\": skipped}"
+      "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nseen = set()\nalready = set(input.get(\"already_billed\") or [])\nperiod = input.get(\"period\") or \"\"\nclean = []\nskipped = []\nfor row in billable:\n    email = row.get(\"email\")\n    amt = row.get(\"amount_cents\")\n    if email in seen:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(email)\n    if email in already:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"already_billed_this_period\"})\n        continue\n    clean.append({\"email\": email, \"amount_cents\": amt, \"period\": period})\noutput = {\"clean\": clean, \"skipped\": skipped}"
     },
     {
       "id": "plan_summary",
