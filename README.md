@@ -49,10 +49,17 @@ account insight from `customer_summary` output. Useful for account reviews
 before a billing run.
 
 All three LLM calls are governed via `station.llm.complete()` with a signed
-egress receipt per call. Requires a Groq API key in the vault:
+egress receipt per call. Supported providers:
 
 ```
+# Groq (free tier available)
 keys.local.json: {"groq": {"GROQ_API_KEY": "gsk_..."}}
+
+# OpenAI
+keys.local.json: {"openai": {"OPENAI_API_KEY": "sk-..."}}
+
+# Anthropic
+railcall set anthropic-key sk-ant-...
 ```
 
 ## Configure before running
