@@ -32,6 +32,29 @@ Also install the module this workflow depends on:
 railcall market install dave/stripe-invoicing
 ```
 
+## AI companion commands (v1.3.0, station v0.45)
+
+`dave/stripe-invoicing` v1.2.3 ships three AI commands that pair well with
+this workflow. Run them before or after the billing run as needed.
+
+`stripe.billing.invoice_description_generate` — generates a professional
+line-item description from service name, period, and client name.
+
+`stripe.billing.dunning_message_draft` — drafts a follow-up email for any
+invoice that surfaces as overdue in `aging_report`. Inputs: invoice_id,
+customer_email, days_overdue, tone (polite / firm / urgent).
+
+`stripe.billing.client_summary_insight` — synthesizes a plain-English
+account insight from `customer_summary` output. Useful for account reviews
+before a billing run.
+
+All three LLM calls are governed via `station.llm.complete()` with a signed
+egress receipt per call. Requires a Groq API key in the vault:
+
+```
+keys.local.json: {"groq": {"GROQ_API_KEY": "gsk_..."}}
+```
+
 ## Configure before running
 
 The published spec ships with anonymous placeholder data so it can stage and
