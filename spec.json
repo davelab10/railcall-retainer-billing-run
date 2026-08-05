@@ -1,8 +1,13 @@
 {
   "id": "dave/retainer-billing-run",
   "title": "Retainer Billing Run",
+  "version": "1.4.0",
+  "kind": "canvas",
+  "status": "CANVAS",
+  "updated": "2026-08-05T00:00:00Z",
   "category": "Finance",
-  "description": "Monthly retainer billing for an agency or small SaaS with a fixed client list. Updated for station v0.45. Five nodes: validate rejects bad rows, dedup removes duplicates and already-billed clients, plan_summary totals planned spend, charge calls stripe_billing_bill_client from dave/stripe-invoicing, reconcile reports intended vs landed. AI companion commands from the same module: use stripe_billing_invoice_description_generate before the run to generate professional invoice descriptions, stripe_billing_dunning_message_draft for overdue follow-ups, stripe_billing_client_summary_insight for account reviews. All AI calls are governed via station.llm with signed egress receipts. As of station v0.39, capabilities.max_spend_cents is enforced natively. contest:2026Q3",
+  "description": "Retainer Billing Run v1.4.0 is a governance-first monthly billing workflow for RailCall Station v0.55. Its five-node legacy canvas remains compatible, while an eight-node engine_spec enables the DAG Runner, Studio Run Button and Context Form, plus MCP DAG list and plan. validate rejects malformed rows; dedup consistently removes duplicate and already-billed emails; plan_summary calculates counts and planned spend; an optional read-only anomaly advisory receives only anonymized batch metrics and never gates charge; charge uses the human-approved, idempotent stripe_billing_bill_client action with a deterministic period-based description; reconcile reports intended versus landed results. Station's native max_spend_cents policy and rollback remain the financial guardrails. Live Stripe and Groq provider completion on the tested Station v0.55 runtime is limited by the documented sandbox DNS hostname-to-IP enforcement issue; this listing does not claim live provider or provider-receipt success. Demo: https://youtu.be/RpGMJgPzEcw contest:2026Q3",
+  "desc": "Governance-first monthly retainer billing with an opt-in anonymised anomaly advisory.",
   "homepage": "https://davelab10.github.io/portofolio/",
   "tests_url": "https://github.com/davelab10/railcall-retainer-billing-run/blob/main/TESTING.md",
   "edges": [
@@ -52,10 +57,12 @@
       }
     ],
     "already_billed": [
-      "cus_example002"
+      "client002@example.com"
     ],
     "billing_period": "2026-07",
-    "spend_ceiling_cents": 50000
+    "spend_ceiling_cents": 50000,
+    "enable_anomaly_advisory": "false",
+    "portfolio_baseline_cents": 0
   },
   "capabilities": {
     "providers": [
@@ -80,7 +87,7 @@
         "already_billed": "{{ctx.already_billed}}",
         "period": "{{ctx.billing_period}}"
       },
-      "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nseen = set()\nalready = set(input.get(\"already_billed\") or [])\nperiod = input.get(\"period\") or \"\"\nclean = []\nskipped = []\nfor row in billable:\n    email = row.get(\"email\")\n    amt = row.get(\"amount_cents\")\n    if email in seen:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(email)\n    if email in already:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"already_billed_this_period\"})\n        continue\n    clean.append({\"email\": email, \"amount_cents\": amt, \"period\": period})\noutput = {\"clean\": clean, \"skipped\": skipped}"
+      "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nseen = set()\nalready = set(input.get(\"already_billed\") or [])\nperiod = str(input.get(\"period\") or \"\").strip()\ndescription = \"Retainer billing for \" + period if period else \"Retainer billing\"\nclean = []\nskipped = []\nfor row in billable:\n    email = row.get(\"email\")\n    amt = row.get(\"amount_cents\")\n    if email in seen:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(email)\n    if email in already:\n        skipped.append({\"email\": email, \"amount_cents\": amt, \"reason\": \"already_billed_this_period\"})\n        continue\n    clean.append({\"email\": email, \"amount_cents\": amt, \"description\": description, \"period\": period})\noutput = {\"clean\": clean, \"skipped\": skipped}"
     },
     {
       "id": "plan_summary",
@@ -112,5 +119,98 @@
       },
       "code": "ps = input.get(\"plan_summary_output\") or {}\nintended = ps.get(\"billable_count\") or 0\ncharge_out = input.get(\"charge_output\") or {}\nraw_items = charge_out.get(\"items\")\nif isinstance(raw_items, list):\n    items = raw_items\nelif charge_out.get(\"invoice_id\") or charge_out.get(\"id\"):\n    items = [charge_out]\nelse:\n    items = []\nlanded_items = [it for it in items if it.get(\"invoice_id\") or it.get(\"id\")]\nlanded = len(landed_items)\noutput = {\n    \"intended\": intended,\n    \"landed\": landed,\n    \"difference\": intended - landed,\n    \"total_planned_cents\": ps.get(\"total_cents\") or 0,\n}"
     }
-  ]
+  ],
+  "engine_spec": {
+    "id": "retainer-billing-run",
+    "title": "Retainer Billing Run",
+    "context": {
+      "clients": [
+        {"email": "client001@example.com", "amount_cents": 7900},
+        {"email": "client002@example.com", "amount_cents": 9500},
+        {"email": "client001@example.com", "amount_cents": 7900},
+        {"email": "", "amount_cents": 8400},
+        {"email": "client003@example.com", "amount_cents": 0}
+      ],
+      "already_billed": ["client002@example.com"],
+      "billing_period": "2026-07",
+      "spend_ceiling_cents": 50000,
+      "portfolio_baseline_cents": 0,
+      "enable_anomaly_advisory": "false"
+    },
+    "capabilities": {
+      "providers": ["stripe", "groq"],
+      "max_spend_cents": 50000,
+      "allow_irreversible": true
+    },
+    "nodes": [
+      {
+        "id": "validate",
+        "type": "transform",
+        "branch": "prepare",
+        "input_from": "{{ctx.clients}}",
+        "code": "def is_valid_amount(v):\n    return isinstance(v, int) and not isinstance(v, bool) and v > 0\n\nbillable = []\nrejected = []\nrows = input if isinstance(input, list) else []\nfor row in rows:\n    if not isinstance(row, dict):\n        rejected.append({\"row\": row, \"reason\": \"not_an_object\"})\n        continue\n    email = row.get(\"email\")\n    amt = row.get(\"amount_cents\")\n    if not isinstance(email, str) or not email.strip():\n        rejected.append({\"row\": row, \"reason\": \"missing_email\"})\n        continue\n    if not is_valid_amount(amt):\n        rejected.append({\"row\": row, \"reason\": \"invalid_amount\"})\n        continue\n    billable.append({\"email\": email.strip(), \"amount_cents\": amt})\noutput = {\"billable\": billable, \"rejected\": rejected}"
+      },
+      {
+        "id": "dedup",
+        "type": "transform",
+        "branch": "prepare",
+        "parent": "validate",
+        "input_from": {"validate_output": "{{nodes.validate.output}}", "already_billed": "{{ctx.already_billed}}", "period": "{{ctx.billing_period}}"},
+        "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nalready = set(x.strip() for x in (input.get(\"already_billed\") or []) if isinstance(x, str) and x.strip())\nseen = set()\nclean = []\nskipped = []\nperiod = str(input.get(\"period\") or \"\").strip()\ndescription = \"Retainer billing for \" + period if period else \"Retainer billing\"\nfor row in billable:\n    email = row.get(\"email\")\n    amount = row.get(\"amount_cents\")\n    if email in seen:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(email)\n    if email in already:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"already_billed_this_period\"})\n        continue\n    clean.append({\"email\": email, \"amount_cents\": amount, \"description\": description, \"period\": period})\noutput = {\"clean\": clean, \"skipped\": skipped}"
+      },
+      {
+        "id": "plan_summary",
+        "type": "transform",
+        "branch": "prepare",
+        "parent": "dedup",
+        "input_from": {"dedup_output": "{{nodes.dedup.output}}", "validate_output": "{{nodes.validate.output}}", "spend_ceiling_cents": "{{ctx.spend_ceiling_cents}}"},
+        "code": "do = input.get(\"dedup_output\") or {}\nvo = input.get(\"validate_output\") or {}\nclean = do.get(\"clean\") or []\nskipped = do.get(\"skipped\") or []\nrejected = vo.get(\"rejected\") or []\ntotal_cents = sum(int(c.get(\"amount_cents\") or 0) for c in clean)\nceiling = input.get(\"spend_ceiling_cents\")\nwithin_cap = isinstance(ceiling, int) and not isinstance(ceiling, bool) and total_cents <= ceiling\noutput = {\"billable_count\": len(clean), \"skipped_count\": len(skipped), \"rejected_count\": len(rejected), \"total_cents\": total_cents, \"spend_ceiling_cents\": ceiling, \"within_cap\": within_cap, \"proceed\": bool(clean) and within_cap}"
+      },
+      {
+        "id": "advisory_switch",
+        "type": "transform",
+        "branch": "advisory",
+        "parent": "plan_summary",
+        "input_from": "{{ctx.enable_anomaly_advisory}}",
+        "code": "value = str(input or \"\").strip().lower()\noutput = {\"enabled\": value in (\"1\", \"true\", \"yes\", \"on\") }"
+      },
+      {
+        "id": "anomaly_payload",
+        "type": "transform",
+        "branch": "advisory",
+        "parent": "advisory_switch",
+        "cond": "{{nodes.advisory_switch.enabled}}",
+        "input_from": {"clean": "{{nodes.dedup.clean}}", "billing_period": "{{ctx.billing_period}}", "portfolio_baseline_cents": "{{ctx.portfolio_baseline_cents}}"},
+        "code": "clean = input.get(\"clean\") or []\nrecords = []\nfor index, row in enumerate(clean):\n    record = {\"record_ref\": \"batch-\" + str(index + 1), \"amount_cents\": int(row.get(\"amount_cents\") or 0), \"invoice_count\": 1}\n    baseline = input.get(\"portfolio_baseline_cents\")\n    if isinstance(baseline, int) and not isinstance(baseline, bool) and baseline > 0:\n        record[\"prior_amount_cents\"] = baseline\n    records.append(record)\noutput = {\"billing_period\": str(input.get(\"billing_period\") or \"\"), \"portfolio\": records, \"portfolio_baseline_cents\": input.get(\"portfolio_baseline_cents\") or 0}"
+      },
+      {
+        "id": "anomaly_preflight",
+        "type": "effect",
+        "branch": "advisory",
+        "parent": "anomaly_payload",
+        "action_id": "groq_billing_billing_anomaly_detect",
+        "provider": "groq",
+        "args": {"billing_period": "{{nodes.anomaly_payload.billing_period}}", "portfolio": "{{nodes.anomaly_payload.portfolio}}", "portfolio_baseline_cents": "{{nodes.anomaly_payload.portfolio_baseline_cents}}"}
+      },
+      {
+        "id": "charge",
+        "type": "effect",
+        "branch": "billing",
+        "parent": "plan_summary",
+        "action_id": "stripe_billing_bill_client",
+        "provider": "stripe",
+        "for_each": "{{nodes.dedup.clean}}",
+        "args": "{{ctx.item}}",
+        "retry": {"max": 3, "backoff_s": 2}
+      },
+      {
+        "id": "reconcile",
+        "type": "transform",
+        "branch": "billing",
+        "parent": "charge",
+        "input_from": {"charge_output": "{{nodes.charge}}", "plan_summary_output": "{{nodes.plan_summary.output}}"},
+        "code": "ps = input.get(\"plan_summary_output\") or {}\ncharge_out = input.get(\"charge_output\") or {}\nraw_items = charge_out.get(\"items\")\nitems = raw_items if isinstance(raw_items, list) else ([charge_out] if charge_out.get(\"invoice_id\") or charge_out.get(\"id\") else [])\nlanded = len([item for item in items if item.get(\"invoice_id\") or item.get(\"id\")])\nintended = ps.get(\"billable_count\") or 0\noutput = {\"intended\": intended, \"landed\": landed, \"difference\": intended - landed, \"total_planned_cents\": ps.get(\"total_cents\") or 0}"
+      }
+    ]
+  }
 }
