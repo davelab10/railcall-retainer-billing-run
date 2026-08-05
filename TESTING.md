@@ -1,105 +1,192 @@
-# Testing
+# Testing report — Retainer Billing Run
 
-Every result below is real output from running the published v1.0.2 spec.json
-through RailCall's own workflow engine (the same plan_workflow / run_workflow
-functions `railcall market stage` and `railcall market apply` call into),
-against Stripe test mode. Nothing here is a description of intended
-behavior. Last run against station v0.42, with the platform's native
-`capabilities.max_spend_cents` guard (landed v0.39) doing the enforcement.
-The workflow's own `cond` gate on the charge node, used through v1.0.1, has
-been removed. As of v1.2.0 the charge node uses `stripe_billing_bill_client`
-from the `dave/stripe-invoicing` module instead of the built-in
-`stripe_charge_create` primitive.
+Workflow ID: `dave/retainer-billing-run`
 
-## 1. Success path, a real Stripe test mode PaymentIntent
+Target runtime: RailCall Station v0.55
+Source: `workflow/spec.json`
 
-Five rows in context.clients: two valid and distinct, one duplicate of the
-first, one with no email, one with a zero amount. One charge should
-survive validate and dedup.
+Workflow version: `1.4.0`. The tested source has `updated: 2026-08-05T00:00:00Z`.
 
-Command run:
+Status legend:
 
-```
-stage = workflow_mcp.stage_workflow(wf, ws=ws, signing=signing)
-res = workflow_mcp.apply_workflow(stage["consent_token"], ws=ws, signing=signing, allow_live=True, live=True)
-```
+- ✅ **Verified** — directly verified through Station, DAG/MCP planning, Studio inspection, static validation, or a provider-independent runtime policy path.
+- ⚠ **Blocked by Station** — execution reached the official provider boundary but Station v0.55 blocked the allowed hostname after DNS resolution.
+- 🧪 **Fixture Only** — transform, advisory, effect output, or reconciliation behavior was exercised with controlled fixture data; it is not a live-provider pass.
 
-Output:
+No live Stripe success, live Groq success, or successful provider receipt is claimed.
 
-```
-outcome: COMPLETED
-taken: [validate, dedup, plan_summary, charge, reconcile]
+## Source and runtime consistency
 
-charge:
-  id: pi_3TyVZ6IiIXjQdCon0luTy1Bz
-  status: succeeded
-  amount: 7900 (usd)
+| Check | Status | Result |
+|---|---|---|
+| Workflow JSON | ✅ Verified | `workflow/spec.json` parses successfully. |
+| Identity | ✅ Verified | ID `dave/retainer-billing-run`; title `Retainer Billing Run`. |
+| Legacy compatibility | ✅ Verified | Five top-level canvas nodes and four valid edges remain present. |
+| `engine_spec` | ✅ Verified | Eight unique DAG nodes with valid parents and bindings. |
+| Runtime copies | ✅ Verified | Source and both Station workflow copies were re-synchronized after the charge-contract correction; all three have the same SHA-256. |
+| Action resolution | ✅ Verified | `stripe_billing_bill_client` and `groq_billing_billing_anomaly_detect` resolved in Station. |
+| Capabilities | ✅ Verified | Providers Stripe/Groq, `max_spend_cents: 50000`, `allow_irreversible: true`. |
 
-reconcile:
-  { intended: 1, landed: 1, difference: 0, blocked_by_cap: false }
+The eight `engine_spec` nodes verified against the source are:
 
-workflow_receipt: outcome COMPLETED, signed true
-```
+| Node | Type | Branch |
+|---|---|---|
+| `validate` | transform | prepare |
+| `dedup` | transform | prepare |
+| `plan_summary` | transform | prepare |
+| `advisory_switch` | transform | advisory |
+| `anomaly_payload` | transform | advisory |
+| `anomaly_preflight` | effect | advisory |
+| `charge` | effect | billing |
+| `reconcile` | transform | billing |
 
-## 2. Platform spend cap blocks the run natively, zero calls to Stripe
+## Default fixture result
 
-Same batch, `capabilities.max_spend_cents` set to 100 against a real planned
-total of 7900. `context.spend_ceiling_cents` was deliberately left wide open
-(999999) in this run to isolate the platform's own guard from anything this
-spec might otherwise do. There is no cond node on the charge node in v1.0.2,
-so this is entirely the platform's own runtime enforcement.
+The shipped anonymous fixture produces these provider-independent transform results:
 
-Output:
+| Stage | Result | Status |
+|---|---|---|
+| Input | Five rows | 🧪 Fixture Only |
+| `validate` | Three billable; two rejected | 🧪 Fixture Only |
+| `dedup` | One clean; two skipped | 🧪 Fixture Only |
+| `plan_summary` | One billable, two skipped, two rejected, total 7,900 cents, within cap | 🧪 Fixture Only |
+| Advisory | Disabled by default | ✅ Verified |
+| Charge preparation | One clean row resolves to the approval-controlled effect | ✅ Verified |
+| Charge input contract | Clean row supplies `email`, `amount_cents`, and deterministic non-empty `description`; real handler validation passes with fixture transport | 🧪 Fixture Only |
+| Provider completion | No Stripe success claimed | ⚠ Blocked by Station |
 
-```
-outcome: ROLLED_BACK
-error: SpendCapExceeded('node charge[0] would spend 7900 cents; cumulative 7900 > max_spend_cents=100')
-taken: [validate, dedup, plan_summary]
-skipped: []
+## Validation
 
-workflow_receipt: signed true, compensated true
-```
+`validate` was exercised with valid rows and the following negative fixtures:
 
-`charge` never entered the loop, so zero requests reached Stripe. The engine
-computed the real spend for the pending iteration and refused before firing,
-not after. The workflow receipt is still signed: a refused run produces a
-legitimate, offline-verifiable audit record shaped as a rollback with an
-error, rather than a clean skip. That shape difference is the one thing worth
-knowing if you are comparing this against the v1.0.1 behavior described in
-older copies of this README: the old workflow-owned gate produced a clean
-`COMPLETED` outcome with `charge` in `skipped` and `reconcile` explaining why.
-The v1.0.2 platform-only guard produces `ROLLED_BACK` with the reason in the
-receipt's `error` field instead. Both stop the batch before it overspends;
-only the audit trail's shape changed.
+- Missing email.
+- Missing amount.
+- Zero amount.
+- Negative amount.
+- Float amount.
+- Boolean amount.
+- Input row that is not an object.
+- Empty client list.
 
-## 3. A row with no email is rejected
+The transform rejects invalid rows before an effect is prepared. These checks are 🧪 fixture results because they require no provider.
 
-Row `{ "email": "", "amount_cents": 8400 }` from the same batch above.
+## Dedup and `already_billed`
 
-Output, from the validate node:
+| Scenario | Status | Result |
+|---|---|---|
+| Duplicate email within one batch | 🧪 Fixture Only | Second occurrence is skipped as `duplicate_in_export`. |
+| Email listed in `already_billed` | 🧪 Fixture Only | Row is skipped as `already_billed_this_period`. |
+| Identifier consistency | ✅ Verified | Client rows, `seen`, and `already_billed` all compare email values. |
+| Previously billed client reaches charge | ✅ Verified | No; the row is absent from `nodes.dedup.clean`. |
 
-```
-{ "row": { "email": "", "amount_cents": 8400 }, "reason": "missing_email" }
-```
+This verifies the earlier customer-ID-versus-email mismatch is no longer present in the current workflow structure.
 
-The row never reaches dedup or charge.
+## Plan Summary
 
-## 4. A duplicate row is detected
+| Check | Status | Result |
+|---|---|---|
+| Counts use validate/dedup outputs | 🧪 Fixture Only | Billable, skipped, and rejected counts match the fixture. |
+| Planned total | 🧪 Fixture Only | Only clean rows contribute to `total_cents`. |
+| `within_cap` and `proceed` | 🧪 Fixture Only | Computed deterministically from clean rows and `spend_ceiling_cents`. |
+| Charge gate | ✅ Verified | `proceed` is not a `cond` on `charge`; native Station spend policy is the financial gate. |
 
-Row `{ "email": "client001@example.com", "amount_cents": 7900 }` appears
-twice in the same batch. validate passes both through since both are
-individually well formed. dedup catches the second occurrence.
+## Optional anomaly advisory
 
-Output, from the dedup node:
+| Check | Status | Result |
+|---|---|---|
+| Disabled by default | ✅ Verified | `enable_anomaly_advisory` defaults to the string `false`. |
+| Enable switch | 🧪 Fixture Only | Accepted true-like values enable the advisory branch. |
+| Action ID and provider | ✅ Verified | `groq_billing_billing_anomaly_detect`, provider `groq`. |
+| Read-only decision support | ✅ Verified | The resolved module command is `read`, `side_effects: none`, and returns `decision_support_only`. |
+| Charge dependency | ✅ Verified | `charge` is parented by `plan_summary`, not by an advisory node, and has no advisory condition. |
+| Payload anonymization | 🧪 Fixture Only | Payload contains opaque `batch-N` references and aggregate amounts/counts only. |
+| Email, name, customer ID, invoice ID | ✅ Verified | None are copied by `anomaly_payload`. |
+| Invalid AI output | 🧪 Fixture Only | Module validation rejects invalid structured output fail-closed. |
+| Live Groq response | ⚠ Blocked by Station | No provider success or egress-provider receipt is claimed. |
 
-```
-{ "email": "client001@example.com", "amount_cents": 7900, "reason": "duplicate_in_export" }
-```
+An advisory failure does not authorize, deny, or alter a charge. AI remains advisory only and never becomes the financial gate.
 
-The same batch also carries a client already present in
-context.already_billed for the period, which dedup catches with a second,
-distinct reason:
+## Approval and governance
 
-```
-{ "email": "client002@example.com", "amount_cents": 9500, "reason": "already_billed_this_period" }
-```
+| Check | Status | Result |
+|---|---|---|
+| Charge action | ✅ Verified | `stripe_billing_bill_client`, provider `stripe`. |
+| Human approval | ✅ Verified | DAG policy resolves charge as an approval-controlled external effect. |
+| Fan-out | ✅ Verified | `for_each` binds to `{{nodes.dedup.clean}}`; args bind to `{{ctx.item}}`. |
+| Retry policy | ✅ Verified | Maximum three attempts with two-second backoff. |
+| Idempotency | ✅ Verified | Resolved module action uses the approved payload hash for Stripe idempotency. |
+| Live Execution Policy | ✅ Verified | Execution remains fail-closed; planning alone does not run provider effects. |
+| Direct provider bypass | ✅ Verified | No workflow node calls Stripe directly outside the governed module action. |
+| Module input contract | 🧪 Fixture Only | Calling the real `stripe.billing.bill_client` handler with a clean row passes required-field validation; fixture request forms retain `Retainer billing for 2026-08`. |
+
+## Spend cap and rollback
+
+| Scenario | Status | Result |
+|---|---|---|
+| Planned total below native cap | 🧪 Fixture Only | Workflow may proceed to the approval/provider boundary. |
+| Native cap below planned effect | ✅ Verified | Station stops before provider execution. |
+| Workflow outcome on cap violation | ✅ Verified | Runtime reports a rolled-back outcome. |
+| Provider call during blocked-cap path | ✅ Verified | No Stripe provider execution occurs. |
+| Advisory bypasses cap | ✅ Verified | No; advisory output is not part of the spend policy or charge condition. |
+| Provider receipt for blocked-cap path | Not claimed | Rollback evidence is a workflow governance result, not a successful provider receipt. |
+
+## Reconcile
+
+| Check | Status | Result |
+|---|---|---|
+| Intended count | 🧪 Fixture Only | Read from `plan_summary.billable_count`. |
+| Landed count | 🧪 Fixture Only | Counts only fixture outputs containing invoice/effect IDs. |
+| Difference | 🧪 Fixture Only | Calculated as intended minus landed. |
+| Live reconciliation | ⚠ Blocked by Station | Cannot be proven against a completed Stripe provider effect in Station v0.55. |
+
+Reconcile is not allowed to infer or manufacture a landed effect when provider output is missing.
+
+## MCP DAG
+
+| Check | Status | Result |
+|---|---|---|
+| `railcall_workflows_dag_list` | ✅ Verified | Lists `retainer-billing-run`. |
+| `railcall_workflow_dag_plan` | ✅ Verified | Accepts the workflow ID and returns the DAG plan. |
+| Plan node count | ✅ Verified | Eight `engine_spec` nodes. |
+| Plan inspection | ✅ Verified | Exposes branches, context, effect nodes, provider requirements, and approval blast radius without executing providers. |
+| MCP live run | Not claimed | Not required while the official sandbox blocker remains. |
+
+## Studio
+
+| Check | Status | Result |
+|---|---|---|
+| Workflow listed | ✅ Verified | Appears as `Retainer Billing Run` in Studio Workflows. |
+| Run Button | ✅ Verified | Present for the `engine_spec` workflow. |
+| Context Form | ✅ Verified | Exposes clients, already billed, billing period, summary ceiling, advisory switch, and portfolio baseline. |
+| Plan/dry inspection | ✅ Verified | Available without claiming a provider run. |
+| Action resolution error | ✅ Verified | No unresolved action in the current DAG plan. |
+
+## Charge input-contract regression
+
+The Step 8 consistency audit found that `dedup` originally omitted `description`, even though `charge` passes each clean row unchanged to `stripe.billing.bill_client` and the module requires a non-empty description. The corrective regression now verifies:
+
+1. Legacy and `engine_spec` dedup both emit `email`, `amount_cents`, `description`, and `period`.
+2. Both rails produce the same `Retainer billing for <billing_period>` value.
+3. An empty period uses the deterministic, non-empty fallback `Retainer billing`.
+4. Multiple clean rows each receive the same period-derived description.
+5. The real module handler accepts the resulting row and carries the description into invoice and line-item preparation under fixture transport.
+
+This is 🧪 **Fixture Only** evidence: it proves the workflow-to-module contract without claiming live Stripe execution.
+
+## Station blocker
+
+Live Stripe and Groq calls are currently ⚠ **Blocked by Station**:
+
+1. The module manifest allows the provider hostname.
+2. Station v0.55 resolves that hostname to an IP address.
+3. The runtime compares the resolved IP against the hostname allowlist.
+4. The provider call is rejected before Stripe or Groq can complete it.
+
+The workflow, DAG, MCP plan, Studio surfaces, validation, dedup, advisory payload, approval boundary, spend policy, and action resolution are still testable. The platform blocker is not recorded as a module defect and is not converted into a fixture-based claim of live success.
+
+## Step 4 conclusion
+
+- ✅ Verified: workflow identity, legacy compatibility, eight-node DAG, action resolution, Studio Run Button, Context Form, MCP list/plan, governance, approval boundary, native spend-cap stop, and rollback behavior.
+- 🧪 Fixture Only: transform outputs, anonymized advisory results, the corrected charge-input contract, and reconciliation outputs.
+- ⚠ Blocked by Station: live Stripe completion, live Groq completion, live provider validation, and provider receipt success.
+- No secret, credential, approval token, real customer data, or provider success identifier is included in this report.

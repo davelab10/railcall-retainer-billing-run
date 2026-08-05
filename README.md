@@ -1,150 +1,187 @@
 # Retainer Billing Run
 
-A RailCall workflow for monthly retainer billing. An agency or small SaaS with
-a fixed client list runs this once a period. Five nodes take the run from a
-raw client list to sent invoices: validate, dedup, plan_summary, charge,
-reconcile.
+`dave/retainer-billing-run` is a governance-first monthly retainer billing workflow for RailCall Station v0.55. It validates a batch, removes duplicate and already-billed clients, summarizes planned spend, optionally requests anonymized AI advice, presents charge effects for human approval, and reconciles intended versus landed results.
 
-- validate rejects any row with no email, no amount, or a non-positive
-  amount, with a reason per rejected row.
-- dedup removes a client that appears twice in one export and a client
-  already present in already_billed for this period, since billing someone
-  twice is the failure that actually hurts a retainer run.
-- plan_summary totals the real planned spend across the whole batch before
-  anything is charged. It is a reporting node, not a gate.
-- charge calls `stripe_billing_bill_client` from the `dave/stripe-invoicing`
-  module — find-or-create customer, draft invoice, finalize, and send, four
-  Stripe calls behind one airlock approval per row. As of station v0.42,
-  installed module commands are first-class workflow effect nodes.
-- reconcile compares what was intended against what actually landed.
+Workflow version: `1.4.0`. The source `updated` field is `2026-08-05T00:00:00Z`.
 
-Demo video: https://youtu.be/jHipCIVVhqI
+Demo video: https://youtu.be/RpGMJgPzEcw
+
+## Workflow diagram
+
+```mermaid
+flowchart LR
+    C[Context Form] --> V[validate]
+    V --> D[dedup]
+    D --> P[plan_summary]
+    P --> S[advisory_switch]
+    S -->|enabled| AP[anomaly_payload]
+    AP --> AI[anomaly_preflight<br/>read-only advisory]
+    P --> G[Station spend cap<br/>and human approval]
+    G --> CH[charge]
+    CH --> R[reconcile]
+
+```
+
+## Legacy canvas and engine DAG
+
+The file retains two compatible representations:
+
+### Legacy canvas rail
+
+The top-level canvas contains five nodes and four edges:
+
+1. `validate`
+2. `dedup`
+3. `plan_summary`
+4. `charge`
+5. `reconcile`
+
+This preserves compatibility with the older canvas workflow loader.
+
+### Station v0.55 `engine_spec`
+
+The modern DAG contains eight nodes across three branches:
+
+| Node | Type | Branch | Purpose |
+|---|---|---|---|
+| `validate` | transform | prepare | Reject malformed rows, missing email, and non-positive or non-integer amounts. |
+| `dedup` | transform | prepare | Remove duplicate exports and emails already billed in the current period. |
+| `plan_summary` | transform | prepare | Count billable, skipped, and rejected rows and total planned cents. |
+| `advisory_switch` | transform | advisory | Parse the opt-in `enable_anomaly_advisory` context value. |
+| `anomaly_payload` | transform | advisory | Build an anonymized portfolio with opaque `batch-N` references. |
+| `anomaly_preflight` | effect | advisory | Call the read-only billing anomaly decision-support command. |
+| `charge` | effect | billing | Fan out clean rows to the approval-controlled billing command. |
+| `reconcile` | transform | billing | Compare intended and landed effects and report the difference. |
+
+The `charge` and advisory branches both descend from `plan_summary`. The advisory branch is not a parent, condition, or gate for `charge`.
+
+## Data flow
+
+### Validate
+
+`validate` reads `ctx.clients`. A valid row requires a non-empty email and a positive integer `amount_cents`. Booleans, floats, zero, negative values, malformed rows, and missing identities are rejected with a reason.
+
+### Dedup and `already_billed`
+
+`dedup` consistently uses email for both protections:
+
+- A repeated email in the same export is skipped as `duplicate_in_export`.
+- An email in `ctx.already_billed` is skipped as `already_billed_this_period`.
+
+The clean output contains `email`, `amount_cents`, `description`, and `period`. `description` is generated deterministically as `Retainer billing for <billing_period>` (with the non-empty fallback `Retainer billing`), so it contains no added PII and does not depend on AI. There is no customer-ID-versus-email comparison mismatch.
+
+### Plan Summary
+
+`plan_summary` reports:
+
+- `billable_count`
+- `skipped_count`
+- `rejected_count`
+- `total_cents`
+- `spend_ceiling_cents`
+- `within_cap`
+- `proceed`
+
+The summary is deterministic and useful for operator review. The platform-enforced financial ceiling is `engine_spec.capabilities.max_spend_cents`; the summary's `proceed` field is not wired as a charge condition.
+
+### Optional AI Advisory
+
+Set `enable_anomaly_advisory` to `true` to enable the advisory branch. It uses action ID `groq_billing_billing_anomaly_detect`, which resolves to the module's `stripe.billing.billing_anomaly_detect` read command.
+
+The advisory is:
+
+- Read-only and `decision_support_only`.
+- Optional and disabled by default.
+- Built from anonymized aggregate metrics.
+- Never a gate for charge.
+- Never permitted to approve, deny, or alter a financial effect.
+
+The payload contains the billing period, aggregate amount fields, counts, optional baseline values, and opaque `batch-N` references. It excludes email, customer name, Stripe customer ID, and invoice ID.
+
+### Charge
+
+`charge` uses:
+
+```text
+action_id: stripe_billing_bill_client
+provider: stripe
+for_each: {{nodes.dedup.clean}}
+args: {{ctx.item}}
+retry: max 3, backoff 2 seconds
+```
+
+The action resolves to `stripe.billing.bill_client` from `dave/stripe-invoicing`. It remains `write_requires_approval`, idempotent, and receipt-required at the module boundary. No path bypasses Station governance to call Stripe directly.
+
+Each clean row supplies the module's required `email`, `amount_cents`, and non-empty `description` fields. A provider-independent regression invoked the real `stripe.billing.bill_client` handler with fixture transport and confirmed the deterministic description reaches invoice and line-item preparation before any provider boundary.
+
+### Reconcile
+
+`reconcile` compares `plan_summary.billable_count` with landed charge outputs containing an invoice or effect ID. It returns `intended`, `landed`, `difference`, and `total_planned_cents`. Reconciliation reports evidence; it does not invent provider success.
+
+## Station v0.55 integration
+
+### DAG Runner and planner
+
+`engine_spec` makes the workflow available to the Station DAG runner and planner. Node parents, branches, conditions, bindings, providers, retry policy, irreversible effects, and capabilities are declared in the workflow source.
+
+### Studio Run Button and Context Form
+
+Studio Workflows renders the workflow with a Run Button and a Context Form generated from `engine_spec.context`. Operators can review or provide:
+
+- `clients`
+- `already_billed`
+- `billing_period`
+- `spend_ceiling_cents`
+- `portfolio_baseline_cents`
+- `enable_anomaly_advisory`
+
+The native maximum spend is declared separately in `engine_spec.capabilities.max_spend_cents`.
+
+### MCP DAG compatibility
+
+The workflow is discoverable through `railcall_workflows_dag_list` and can be inspected without execution through `railcall_workflow_dag_plan`. Planning exposes the DAG and financial blast radius but does not call Stripe or Groq.
+
+## Governance
+
+The `engine_spec` capabilities are:
+
+```json
+{
+  "providers": ["stripe", "groq"],
+  "max_spend_cents": 50000,
+  "allow_irreversible": true
+}
+```
+
+- **Approval:** `stripe_billing_bill_client` remains a human-approved external effect.
+- **Spend cap:** Station enforces `max_spend_cents` before provider execution and across the charge fan-out.
+- **Rollback:** a cap violation produces a rolled-back workflow outcome before the blocked effect reaches Stripe.
+- **Idempotency:** the module derives Stripe idempotency keys from approved payload hashes.
+- **Reconcile:** intended and landed results remain explicit even when execution is incomplete.
+- **Receipts:** workflow and command receipts are Station-governed; this document does not claim a provider receipt for the currently blocked live path.
+
+`allow_irreversible: true` declares that the workflow contains an irreversible-capable billing effect; it does not remove approval or spend-cap enforcement.
 
 ## Install
 
-```
+```sh
 railcall market install dave/retainer-billing-run
-```
-
-Also install the module this workflow depends on:
-
-```
 railcall market install dave/stripe-invoicing
 ```
 
-## AI companion commands (v1.3.0, station v0.45)
+Replace the anonymous example context before a real billing run. Keep `already_billed` in the same email format used by client rows.
 
-`dave/stripe-invoicing` v1.2.3 ships three AI commands that pair well with
-this workflow. Run them before or after the billing run as needed.
+## Known limitation
 
-`stripe.billing.invoice_description_generate` — generates a professional
-line-item description from service name, period, and client name.
+### Station v0.55 sandbox DNS
 
-`stripe.billing.dunning_message_draft` — drafts a follow-up email for any
-invoice that surfaces as overdue in `aging_report`. Inputs: invoice_id,
-customer_email, days_overdue, tone (polite / firm / urgent).
+Live provider execution is currently limited by a RailCall Station v0.55 sandbox DNS bug. An allowed Stripe or Groq hostname resolves to an IP address, then the runtime rejects that resolved IP because the allowlist contains the hostname.
 
-`stripe.billing.client_summary_insight` — synthesizes a plain-English
-account insight from `customer_summary` output. Useful for account reviews
-before a billing run.
-
-All three LLM calls are governed via `station.llm.complete()` with a signed
-egress receipt per call. Supported providers:
-
-```
-# Groq (free tier available)
-keys.local.json: {"groq": {"GROQ_API_KEY": "gsk_..."}}
-
-# OpenAI
-keys.local.json: {"openai": {"OPENAI_API_KEY": "sk-..."}}
-
-# Anthropic
-railcall set anthropic-key sk-ant-...
-```
-
-## Configure before running
-
-The published spec ships with anonymous placeholder data so it can stage and
-run out of the box. Replace it with your own before using it for real:
-
-- `context.clients`: your client list, each row `{ "email": "...", "amount_cents": ... }`.
-- `context.already_billed`: emails already billed for the current period, so a rerun does not double charge.
-- `context.billing_period`: a label for the current period, for example `"2026-08"`.
-- `capabilities.max_spend_cents`: the total you are willing to charge in one run. As of station v0.39 this is the field that actually stops the run, enforced by the platform itself, not by this spec.
-
-Without this step the workflow only knows about the example rows shipped in
-the spec, which are not useful to anyone but the person who wrote them.
-
-`context.spend_ceiling_cents` is still present in the spec and still totaled
-by plan_summary for the reconcile report, but it is informational only. It
-does not gate anything. Edit `capabilities.max_spend_cents` if you want to
-change what actually stops a run.
-
-## Real test results
-
-Both runs below are actual output from staging and applying the v1.0.2 spec
-against Stripe test mode, not a description of intended behavior.
-
-**Success path.** Five clean rows in, two rejected by validate, two removed
-by dedup, one charge sent, no manual gate anywhere in the spec:
-
-```
-outcome: COMPLETED
-taken: [validate, dedup, plan_summary, charge, reconcile]
-charge.status: succeeded
-charge.id: pi_3TyVZ6IiIXjQdCon0luTy1Bz
-charge.amount: 7900 (usd)
-reconcile: { intended: 1, landed: 1, difference: 0, blocked_by_cap: false }
-workflow_receipt: outcome COMPLETED, signed true
-```
-
-**Platform spend cap blocks the run natively, zero calls to Stripe.** Same
-spec, `capabilities.max_spend_cents` set to 100 against a real planned total
-of 7900. There is no cond node on charge to trip. The block is the platform's
-own runtime guard:
-
-```
-outcome: ROLLED_BACK
-error: SpendCapExceeded('node charge[0] would spend 7900 cents; cumulative 7900 > max_spend_cents=100')
-taken: [validate, dedup, plan_summary]
-workflow_receipt: signed true, compensated true
-```
-
-The receipt is signed either way. A refused run still produces a legitimate,
-offline-verifiable audit record, it is just shaped as a rollback with an
-error instead of a clean skip. See TESTING.md for the full transcripts.
-
-## Three things worth knowing before you edit this spec
-
-**As of station v0.42, module commands are first-class workflow effect nodes.**
-The charge node uses `stripe_billing_bill_client` (action_id format:
-`provider_verb`) from the `dave/stripe-invoicing` module. This means billing
-is governed: find-or-create customer, draft invoice, finalize, and send — four
-Stripe calls behind one airlock approval, with a Stripe Idempotency-Key
-derived from the payload hash on every write.
-
-**As of station v0.39, `capabilities.max_spend_cents` is enforced natively at
-run time for a node inside a `for_each`.** The engine tracks cumulative spend
-across iterations, reading each iteration's actual spend from the node's
-receipt first, then its resolved output, then a re-estimate of the args,
-whichever is highest, and raises `SpendCapExceeded` to roll back the whole
-run once an iteration would push spend past the declared ceiling. This
-workflow's own `cond` gate on the charge node, present through v1.0.1, is
-gone as of v1.0.2. The run-time guard is what matters, and it is verified
-above against this exact spec, not assumed from a changelog entry.
-
-**`for_each` is only evaluated when the workflow runs, not during staging.**
-A binding typo in that field passes staging with no warning and only breaks,
-or silently produces nothing, once the workflow runs for real. If you edit
-the `charge` node, test the change with a live run against Stripe test mode,
-not just a stage.
+The workflow is compatible with the Station v0.55 DAG runner, Studio Run Button, Context Form, MCP DAG list, and MCP DAG plan. Transform logic, charge input preparation, planning, governance, approval boundaries, spend-cap behavior, and anonymized advisory payloads have provider-independent evidence. Live Stripe, live Groq, and provider-receipt completion cannot be claimed until the official Station sandbox issue is resolved.
 
 ## Testing
 
-See [TESTING.md](TESTING.md) for the actual commands run and their real
-output: the success path with a real Stripe test mode PaymentIntent, the
-platform's native spend cap blocking a run with zero calls to Stripe, a row
-with no email being rejected, and a duplicate row being caught.
+See [TESTING.md](TESTING.md) for the Step 4 evidence and the separation between verified behavior, fixture-only results, and provider execution blocked by Station.
 
 ## License
 
