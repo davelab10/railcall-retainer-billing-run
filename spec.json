@@ -1,15 +1,19 @@
 {
   "id": "dave/retainer-billing-run",
   "title": "Retainer Billing Run",
-  "version": "1.4.0",
+  "version": "1.6.0",
   "kind": "canvas",
   "status": "CANVAS",
-  "updated": "2026-08-05T00:00:00Z",
+  "updated": "2026-08-09T00:00:00Z",
   "category": "Finance",
-  "description": "Retainer Billing Run v1.4.0 is a governance-first monthly billing workflow for RailCall Station v0.55. Its five-node legacy canvas remains compatible, while an eight-node engine_spec enables the DAG Runner, Studio Run Button and Context Form, plus MCP DAG list and plan. validate rejects malformed rows; dedup consistently removes duplicate and already-billed emails; plan_summary calculates counts and planned spend; an optional read-only anomaly advisory receives only anonymized batch metrics and never gates charge; charge uses the human-approved, idempotent stripe_billing_bill_client action with a deterministic period-based description; reconcile reports intended versus landed results. Station's native max_spend_cents policy and rollback remain the financial guardrails. Live Stripe and Groq provider completion on the tested Station v0.55 runtime is limited by the documented sandbox DNS hostname-to-IP enforcement issue; this listing does not claim live provider or provider-receipt success. Demo: https://youtu.be/RpGMJgPzEcw contest:2026Q3",
-  "desc": "Governance-first monthly retainer billing with an opt-in anonymised anomaly advisory.",
+  "description": "Retainer Billing Run v1.6.0 is a governance-first monthly billing workflow for RailCall Station v0.65. Its five-node legacy canvas remains compatible, while an eight-node engine_spec adds the real incremental stripe_billing_invoice_list source before dedup. The workflow combines the operator-provided already_billed guard with same-period Stripe invoice history using deterministic description, email, amount, timestamp-month, and invoice-status matching. A failed history read stops before charge, while truncated history holds all candidates so partial duplicate evidence cannot authorize billing. validate, plan_summary, the optional anonymised advisory preparation, approval-controlled idempotent charge, max_spend_cents policy, and truthful reconcile behavior remain intact. Scheduling uses this same workflow and Station-owned watermark state; no schedule bypasses native approval policy. Provider success is claimed only when evidenced by a real receipt. Demo: https://youtu.be/RpGMJgPzEcw contest:2026Q3",
+  "desc": "Governance-first monthly retainer billing with incremental Stripe-history dedup and an opt-in anonymised anomaly advisory.",
   "homepage": "https://davelab10.github.io/portofolio/",
   "tests_url": "https://github.com/davelab10/railcall-retainer-billing-run/blob/main/TESTING.md",
+  "module_dependency": {
+    "id": "dave/stripe-invoicing",
+    "minimum_version": "1.3.0"
+  },
   "edges": [
     {
       "from": "validate",
@@ -62,6 +66,7 @@
     "billing_period": "2026-07",
     "spend_ceiling_cents": 50000,
     "enable_anomaly_advisory": "false",
+    "operator_declared_groq_credential_available": "false",
     "portfolio_baseline_cents": 0
   },
   "capabilities": {
@@ -135,10 +140,11 @@
       "billing_period": "2026-07",
       "spend_ceiling_cents": 50000,
       "portfolio_baseline_cents": 0,
-      "enable_anomaly_advisory": "false"
+      "enable_anomaly_advisory": "false",
+      "operator_declared_groq_credential_available": "false"
     },
     "capabilities": {
-      "providers": ["stripe", "groq"],
+      "providers": ["stripe"],
       "max_spend_cents": 50000,
       "allow_irreversible": true
     },
@@ -151,12 +157,22 @@
         "code": "def is_valid_amount(v):\n    return isinstance(v, int) and not isinstance(v, bool) and v > 0\n\nbillable = []\nrejected = []\nrows = input if isinstance(input, list) else []\nfor row in rows:\n    if not isinstance(row, dict):\n        rejected.append({\"row\": row, \"reason\": \"not_an_object\"})\n        continue\n    email = row.get(\"email\")\n    amt = row.get(\"amount_cents\")\n    if not isinstance(email, str) or not email.strip():\n        rejected.append({\"row\": row, \"reason\": \"missing_email\"})\n        continue\n    if not is_valid_amount(amt):\n        rejected.append({\"row\": row, \"reason\": \"invalid_amount\"})\n        continue\n    billable.append({\"email\": email.strip(), \"amount_cents\": amt})\noutput = {\"billable\": billable, \"rejected\": rejected}"
       },
       {
+        "id": "invoice_history",
+        "type": "effect",
+        "branch": "prepare",
+        "parent": "validate",
+        "action_id": "stripe_billing_invoice_list",
+        "provider": "stripe",
+        "args": {"limit": 100},
+        "retry": {"max": 2, "backoff_s": 2}
+      },
+      {
         "id": "dedup",
         "type": "transform",
         "branch": "prepare",
-        "parent": "validate",
-        "input_from": {"validate_output": "{{nodes.validate.output}}", "already_billed": "{{ctx.already_billed}}", "period": "{{ctx.billing_period}}"},
-        "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nalready = set(x.strip() for x in (input.get(\"already_billed\") or []) if isinstance(x, str) and x.strip())\nseen = set()\nclean = []\nskipped = []\nperiod = str(input.get(\"period\") or \"\").strip()\ndescription = \"Retainer billing for \" + period if period else \"Retainer billing\"\nfor row in billable:\n    email = row.get(\"email\")\n    amount = row.get(\"amount_cents\")\n    if email in seen:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(email)\n    if email in already:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"already_billed_this_period\"})\n        continue\n    clean.append({\"email\": email, \"amount_cents\": amount, \"description\": description, \"period\": period})\noutput = {\"clean\": clean, \"skipped\": skipped}"
+        "parent": "invoice_history",
+        "input_from": {"validate_output": "{{nodes.validate.output}}", "invoice_history": "{{nodes.invoice_history._}}", "already_billed": "{{ctx.already_billed}}", "period": "{{ctx.billing_period}}"},
+        "code": "vo = input.get(\"validate_output\") or {}\nbillable = vo.get(\"billable\") or []\nalready = set(x.strip().lower() for x in (input.get(\"already_billed\") or []) if isinstance(x, str) and x.strip())\nperiod = str(input.get(\"period\") or \"\").strip()\ndescription = \"Retainer billing for \" + period if period else \"Retainer billing\"\nhistory = input.get(\"invoice_history\") or {}\nhistory_rows = history.get(\"invoices\") if isinstance(history, dict) else []\nhistory_rows = history_rows if isinstance(history_rows, list) else []\nhistory_truncated = bool(history.get(\"truncated\")) if isinstance(history, dict) else False\nhistory_keys = set()\nfor invoice in history_rows:\n    if not isinstance(invoice, dict):\n        continue\n    hist_email = invoice.get(\"customer_email\")\n    hist_amount = invoice.get(\"amount_due_cents\")\n    hist_description = invoice.get(\"description\")\n    created_at = invoice.get(\"created_at\")\n    hist_status = invoice.get(\"status\")\n    if not isinstance(hist_email, str) or not hist_email.strip():\n        continue\n    if not isinstance(hist_amount, int) or isinstance(hist_amount, bool) or hist_amount <= 0:\n        continue\n    if hist_description != description:\n        continue\n    if not isinstance(created_at, str) or created_at[:7] != period:\n        continue\n    if hist_status not in (\"open\", \"paid\", \"uncollectible\"):\n        continue\n    history_keys.add((hist_email.strip().lower(), hist_amount))\nseen = set()\nclean = []\nskipped = []\nfor row in billable:\n    email = row.get(\"email\")\n    amount = row.get(\"amount_cents\")\n    email_key = email.strip().lower() if isinstance(email, str) else \"\"\n    if email_key in seen:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"duplicate_in_export\"})\n        continue\n    seen.add(email_key)\n    if email_key in already:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"already_billed_this_period\"})\n        continue\n    if history_truncated:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"invoice_history_truncated_fail_closed\"})\n        continue\n    if (email_key, amount) in history_keys:\n        skipped.append({\"email\": email, \"amount_cents\": amount, \"reason\": \"stripe_history_same_period\"})\n        continue\n    clean.append({\"email\": email, \"amount_cents\": amount, \"description\": description, \"period\": period})\noutput = {\"clean\": clean, \"skipped\": skipped, \"history_invoices_considered\": len(history_keys), \"history_truncated\": history_truncated, \"stripe_history_skipped_count\": len([row for row in skipped if row.get(\"reason\") == \"stripe_history_same_period\"])}"
       },
       {
         "id": "plan_summary",
@@ -164,15 +180,15 @@
         "branch": "prepare",
         "parent": "dedup",
         "input_from": {"dedup_output": "{{nodes.dedup.output}}", "validate_output": "{{nodes.validate.output}}", "spend_ceiling_cents": "{{ctx.spend_ceiling_cents}}"},
-        "code": "do = input.get(\"dedup_output\") or {}\nvo = input.get(\"validate_output\") or {}\nclean = do.get(\"clean\") or []\nskipped = do.get(\"skipped\") or []\nrejected = vo.get(\"rejected\") or []\ntotal_cents = sum(int(c.get(\"amount_cents\") or 0) for c in clean)\nceiling = input.get(\"spend_ceiling_cents\")\nwithin_cap = isinstance(ceiling, int) and not isinstance(ceiling, bool) and total_cents <= ceiling\noutput = {\"billable_count\": len(clean), \"skipped_count\": len(skipped), \"rejected_count\": len(rejected), \"total_cents\": total_cents, \"spend_ceiling_cents\": ceiling, \"within_cap\": within_cap, \"proceed\": bool(clean) and within_cap}"
+        "code": "do = input.get(\"dedup_output\") or {}\nvo = input.get(\"validate_output\") or {}\nclean = do.get(\"clean\") or []\nskipped = do.get(\"skipped\") or []\nrejected = vo.get(\"rejected\") or []\ntotal_cents = sum(int(c.get(\"amount_cents\") or 0) for c in clean)\nceiling = input.get(\"spend_ceiling_cents\")\nwithin_cap = isinstance(ceiling, int) and not isinstance(ceiling, bool) and total_cents <= ceiling\noutput = {\"billable_count\": len(clean), \"skipped_count\": len(skipped), \"rejected_count\": len(rejected), \"stripe_history_skipped_count\": do.get(\"stripe_history_skipped_count\") or 0, \"history_invoices_considered\": do.get(\"history_invoices_considered\") or 0, \"history_truncated\": bool(do.get(\"history_truncated\")), \"total_cents\": total_cents, \"spend_ceiling_cents\": ceiling, \"within_cap\": within_cap, \"proceed\": bool(clean) and within_cap}"
       },
       {
         "id": "advisory_switch",
         "type": "transform",
         "branch": "advisory",
         "parent": "plan_summary",
-        "input_from": "{{ctx.enable_anomaly_advisory}}",
-        "code": "value = str(input or \"\").strip().lower()\noutput = {\"enabled\": value in (\"1\", \"true\", \"yes\", \"on\") }"
+        "input_from": {"requested": "{{ctx.enable_anomaly_advisory}}", "operator_declared_available": "{{ctx.operator_declared_groq_credential_available}}"},
+        "code": "true_values = (\"1\", \"true\", \"yes\", \"on\")\nrequested = str(input.get(\"requested\") or \"\").strip().lower() in true_values\noperator_declared_available = str(input.get(\"operator_declared_available\") or \"\").strip().lower() in true_values\nenabled = requested and operator_declared_available\nif not requested:\n    status = \"disabled\"\n    reason = \"Anomaly advisory disabled by workflow context.\"\nelif not operator_declared_available:\n    status = \"skipped\"\n    reason = \"Operator did not declare a Groq credential available; anomaly advisory skipped and deterministic billing continues.\"\nelse:\n    status = \"prepared\"\n    reason = \"Operator declared a Groq credential available; anonymized advisory payload prepared for a separate operator-run billing_anomaly_detect preflight. Deterministic billing continues independently.\"\noutput = {\"enabled\": enabled, \"requested\": requested, \"operator_declared_credential_available\": operator_declared_available, \"availability_source\": \"operator_context\", \"status\": status, \"reason\": reason, \"execution_mode\": \"separate_operator_preflight\" if enabled else \"not_run\", \"decision_support_only\": True, \"charge_independent\": True}"
       },
       {
         "id": "anomaly_payload",
@@ -182,15 +198,6 @@
         "cond": "{{nodes.advisory_switch.enabled}}",
         "input_from": {"clean": "{{nodes.dedup.clean}}", "billing_period": "{{ctx.billing_period}}", "portfolio_baseline_cents": "{{ctx.portfolio_baseline_cents}}"},
         "code": "clean = input.get(\"clean\") or []\nrecords = []\nfor index, row in enumerate(clean):\n    record = {\"record_ref\": \"batch-\" + str(index + 1), \"amount_cents\": int(row.get(\"amount_cents\") or 0), \"invoice_count\": 1}\n    baseline = input.get(\"portfolio_baseline_cents\")\n    if isinstance(baseline, int) and not isinstance(baseline, bool) and baseline > 0:\n        record[\"prior_amount_cents\"] = baseline\n    records.append(record)\noutput = {\"billing_period\": str(input.get(\"billing_period\") or \"\"), \"portfolio\": records, \"portfolio_baseline_cents\": input.get(\"portfolio_baseline_cents\") or 0}"
-      },
-      {
-        "id": "anomaly_preflight",
-        "type": "effect",
-        "branch": "advisory",
-        "parent": "anomaly_payload",
-        "action_id": "groq_billing_billing_anomaly_detect",
-        "provider": "groq",
-        "args": {"billing_period": "{{nodes.anomaly_payload.billing_period}}", "portfolio": "{{nodes.anomaly_payload.portfolio}}", "portfolio_baseline_cents": "{{nodes.anomaly_payload.portfolio_baseline_cents}}"}
       },
       {
         "id": "charge",
