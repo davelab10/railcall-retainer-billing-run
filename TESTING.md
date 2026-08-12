@@ -1,65 +1,62 @@
-# Testing report — Retainer Billing Run v1.6.0
+# Testing report — `dave/retainer-billing-run` v1.7.0
 
-Workflow ID: `dave/retainer-billing-run`  
-Target runtime: RailCall Station v0.66  
-Module dependency: `dave/stripe-invoicing >= 1.3.0`
+Demo video: https://youtu.be/ezVvjoQb3lU
 
-Demo video: https://youtu.be/He6ZvGOjjt8
-
-This report summarizes the completed workflow verification. Fixture evidence, policy refusal, and provider evidence remain distinct; no missing provider effect is presented as success.
+This report summarizes the final workflow verification. Automated tests, controlled effect harnesses, provider evidence, and environment limitations are kept separate.
 
 ## Final status
 
 | Check | Result |
 |---|---|
-| Workflow identity | `dave/retainer-billing-run` v1.6.0 |
+| Workflow identity | `dave/retainer-billing-run` v1.7.0 |
+| Module dependency | `dave/stripe-invoicing >= 1.4.0` |
 | Legacy canvas | 5 nodes |
-| Engine DAG | Exactly 8 nodes |
-| Workflow regression | 14/14 PASS |
-| Runtime copy | Matches final source |
-| Module dependency | PASS |
+| Engine DAG | Exactly 13 nodes |
+| Workflow regression | 16 passed |
+| Combined module + workflow regression | 47 passed; 34 subtests |
 | Action resolution | PASS |
 | Incremental integration | PASS |
 | Scheduling compatibility | PASS |
 | Approval-controlled billing path | PASS |
-| Reconcile behavior | PASS |
-| Station v0.66 compatibility | PASS; no workflow migration required |
+| Spend ceiling | PASS |
+| Reconcile / recovery / settle | PASS |
 
-Final engine nodes:
+## Automated regression
 
-1. `validate`
-2. `invoice_history`
-3. `dedup`
-4. `plan_summary`
-5. `advisory_switch`
-6. `anomaly_payload`
-7. `charge`
-8. `reconcile`
+The final workflow suite passed **16 tests**. Together with the module suite, the final regression result was **47 passed across 34 subtests**.
 
-`invoice_history` is the only added node. `dedup` and `plan_summary` are the changed nodes.
+Coverage includes:
 
-## Validation matrix
+- workflow identity, v1.7.0 dependency, legacy canvas, and exact 13-node order;
+- action resolution for `stripe_billing_invoice_list` and `stripe_billing_bill_client`;
+- Station-owned incremental registration and schedule injection;
+- malformed input, duplicate input, and whole-integer validation;
+- `already_billed` and relevant provider-history matching;
+- unrelated one-off history remaining non-blocking;
+- truncated history and source failure preventing charge;
+- deterministic plan hash and project `billing_run_id` binding;
+- review findings, configurable approval tiers, and execution guard refusal;
+- controlled charge fan-out and truthful reconcile output;
+- execution refusal before charge when the guard blocks;
+- the project-owned approval/recovery reference contract.
 
-The completed runtime matrix covers:
+## Validation and deduplication
 
-- valid input;
-- duplicate input;
-- operator-provided `already_billed`;
-- blank email;
-- zero amount;
-- float amount;
-- relevant same-period provider history;
-- unrelated one-off history;
-- truncated history;
-- history-source failure;
-- over-cap billing;
-- no-billable input.
+Verified cases:
 
-Invalid rows are rejected before effects are prepared. Clean rows retain `email`, whole-integer `amount_cents`, period, and the deterministic description `Retainer billing for <billing_period>`.
+- malformed input is rejected before an effect is prepared;
+- `duplicate_in_export` does not create a second candidate;
+- `already_billed_this_period` is skipped;
+- relevant same-period retainer history produces `stripe_history_same_period`;
+- an unrelated one-off invoice does not suppress a valid candidate;
+- history-source failure produces zero charge calls;
+- no unintended charge is produced by invalid or already-billed rows.
 
-## Incremental history and dedup
+## Incremental history
 
-`invoice_history` resolves to the existing incremental `stripe_billing_invoice_list` action. Station v0.66 returns the effect through a flattened wrapper, and the final binding reads the actual invoice list from:
+`invoice_history` resolves through the module's `stripe_billing_invoice_list` action. Station owns `since`, `exclude_invoice_ids`, cursor, seen-window, and watermark state. The workflow contains no local cursor or hardcoded `since`.
+
+The v1.7 runtime binding reads the flattened effect wrapper's list from:
 
 ```text
 {{nodes.invoice_history._}}
@@ -67,72 +64,54 @@ Invalid rows are rejected before effects are prepared. Clean rows retain `email`
 
 Verified behavior:
 
-- matching same-period retainer history produces `stripe_history_same_period`;
-- the matching candidate is removed before `charge`;
-- unrelated one-off invoices do not suppress a valid candidate;
-- operator `already_billed` protection remains active;
-- duplicate input remains suppressed;
-- truncated history blocks candidates safely;
-- history-source failure prevents charge;
-- no hardcoded `since` exists in the workflow;
-- incremental state and watermark remain Station-owned.
+- complete history can be matched deterministically;
+- `truncated: true` fails closed rather than assuming the customer was not billed;
+- history failure prevents `charge`;
+- failed, truncated, manual, and unresolved runs hold schedule-owned watermark advancement;
+- schedule overlap uses `skip` rather than concurrent duplicate work.
 
-## Scheduling
+## Plan, execution guard, and spend
 
-Scheduling compatibility passed with a 15-minute interval and concurrency `skip`.
+`plan_summary`, `review_summary`, and `approval_tier` produce a reviewable plan and required approval tier. `execution_guard` requires a valid readiness/approval condition and matching approved plan identity. A wrong hash or blocking review condition stops the workflow before `charge` and is not reported as a completed run.
 
-- A successful scheduled run advanced the watermark from `2026-08-09T00:00:00Z` to `2026-08-09T00:01:00Z`.
-- Failed, truncated, and manual runs did not advance schedule-owned state.
-- Overlap produced `SKIPPED_OVERLAP`.
-- Missed ticks did not burst-replay.
-- The tested schedule was disabled after verification.
-- Live execution remains constrained by Station policy and approval.
+Controlled spend-cap verification covered the three important boundaries:
 
-## Approval, plan pin, and spend cap
+- 700 cents with a 699-cent cap: blocked before charge;
+- 700 cents with a 700-cent cap: allowed;
+- 1,100 cents with a 1,000-cent cap: the first under-cap item may land and the next effect is blocked before exceeding the cap.
 
-`charge` resolves to `stripe_billing_bill_client`, an approval-controlled external effect from module v1.3.0. The workflow does not call Stripe directly.
+The cap result is not described as automatic Stripe rollback or compensation for an effect that already landed.
 
-Verified governance behavior:
+## Reconcile, recovery, and settlement
 
-- the reviewed plan is pinned to its approval;
-- mutation requires a new approved plan;
-- clean candidates fan out only after validation and deduplication;
-- the native cumulative spend cap applies before provider execution;
-- a 50,001-cent fixture produced `SpendCapExceeded` before charge;
-- the blocked-cap receipt recorded `external_api_touched: false` and held the watermark.
+The controlled mixed-result case preserved:
 
-Idempotency remains the module's safe-retry boundary and is not described as rollback.
+- a landed result;
+- an unknown/unresolved result;
+- the unresolved amount;
+- `safe_to_retry: false`;
+- a held watermark action;
+- unresolved settlement;
+- a recovery requirement before retry.
 
-## Advisory isolation
+Unknown is not treated as a clean failure. Recovery uses provider truth to avoid retrying an effect already known to have landed. The workflow does not claim automatic external compensation.
 
-The optional advisory path is minimized, read-only, and separate from the billing critical path. It cannot approve, deny, alter, or execute a charge. Missing credentials or invalid advisory output do not create financial authority.
+## Advisory boundary
 
-Live Groq completion was not demonstrated and is not claimed.
+The advisory path uses `advisory_switch` and `anomaly_payload` with minimized facts. It is read-only and separate from the deterministic billing path. Advisory failure, unavailable credentials, or invalid advisory output cannot authorize, deny, or execute a charge.
 
-## Reconcile
+No native provider success is inferred from advisory fixtures or controlled harness output.
 
-Reconcile reports intended and landed effects without manufacturing provider success. When charge output lacks invoice evidence, the verified result is:
+## Receipts and provenance
 
-```text
-intended = 1
-landed = 0
-difference = 1
-```
+Workflow receipts and integrity evidence were checked where produced by the verified paths. Provider success is claimed only when a provider receipt or effect supports it. Controlled effect fan-out and recovery tests use harmless harness/provider stubs; they are not production financial writes.
 
-This remains truthful for incomplete, policy-blocked, or provider-missing outcomes.
+No secret, credential, approval token, production customer data, private path, or signing material belongs in this report.
 
-## Studio and planning surfaces
+## Test-environment limitation
 
-The workflow is listed in Studio v0.66 with its Run and Visual surfaces. Context, DAG structure, action resolution, scheduling compatibility, plan blast radius, approval boundary, spend ceiling, and reconcile output are inspectable without bypassing governance.
-
-## Evidence boundaries
-
-- Provider success is claimed only when an actual provider receipt or effect supports it.
-- Live Groq success is not claimed.
-- Fixture output is labeled as fixture/runtime-policy evidence rather than live-provider completion.
-- No secret, credential, approval token, customer production data, private path, or signing material belongs in this report.
-- Station v0.66 receipt-persistence failure may still return `executed: true` alongside `ok: false`; this workflow documentation does not claim otherwise.
+Native multi-member Team quorum was **not exercised** because the local environment requires a second independent Station identity. This is an environment limitation, not a workflow defect. No native Team-quorum E2E verification is claimed.
 
 ## Conclusion
 
-Workflow v1.6.0 is final for Station v0.66: five legacy nodes, exactly eight engine nodes, history-aware incremental deduplication, fail-closed source and truncation handling, schedule-owned watermark settlement, isolated advisory behavior, approval-controlled billing, native spend-cap enforcement, plan pinning, and truthful reconciliation. No workflow source migration was required for Station v0.66.
+Workflow v1.7.0 is verified with five legacy canvas nodes and exactly 13 engine nodes. Validation, history-aware deduplication, fail-closed truncation handling, deterministic plan/guard binding, spend-cap boundaries, approval-controlled charge fan-out, reconcile/recovery/settle semantics, and advisory isolation passed. The only stated verification limitation is the unavailable second identity for native multi-member Team quorum.
