@@ -1,6 +1,6 @@
-# Testing report — `dave/retainer-billing-run` v1.7.0
+# Testing report — `dave/retainer-billing-run` v1.8.0
 
-Demo video: https://youtu.be/ezVvjoQb3lU
+Demo video: https://youtu.be/x79XvHJK-_M
 
 This report summarizes the final workflow verification. Automated tests, controlled effect harnesses, provider evidence, and environment limitations are kept separate.
 
@@ -8,12 +8,13 @@ This report summarizes the final workflow verification. Automated tests, control
 
 | Check | Result |
 |---|---|
-| Workflow identity | `dave/retainer-billing-run` v1.7.0 |
-| Module dependency | `dave/stripe-invoicing >= 1.4.0` |
+| Workflow identity | `dave/retainer-billing-run` v1.8.0 |
+| Module dependency | `dave/stripe-invoicing >= 1.5.0` (current module v1.5.0) |
 | Legacy canvas | 5 nodes |
-| Engine DAG | Exactly 13 nodes |
-| Workflow regression | 16 passed |
-| Combined module + workflow regression | 47 passed; 34 subtests |
+| Engine DAG | Exactly 14 nodes |
+| Workflow regression | 19/19 passed |
+| Module regression | 50/50 passed |
+| Combined module + workflow regression | 69/69 passed |
 | Action resolution | PASS |
 | Incremental integration | PASS |
 | Scheduling compatibility | PASS |
@@ -23,12 +24,12 @@ This report summarizes the final workflow verification. Automated tests, control
 
 ## Automated regression
 
-The final workflow suite passed **16 tests**. Together with the module suite, the final regression result was **47 passed across 34 subtests**.
+The final workflow suite passed **19/19 tests**. The module suite passed **50/50**, for a combined **69/69** result. These are regression/synthetic checks, not a claim that the latest verification executed a live financial write.
 
 Coverage includes:
 
-- workflow identity, v1.7.0 dependency, legacy canvas, and exact 13-node order;
-- action resolution for `stripe_billing_invoice_list` and `stripe_billing_bill_client`;
+- workflow identity, v1.8.0 dependency, legacy canvas, and exact 14-node order;
+- action resolution for `stripe_billing_invoice_list`, `stripe_billing_account_preflight`, and `stripe_billing_bill_client`;
 - Station-owned incremental registration and schedule injection;
 - malformed input, duplicate input, and whole-integer validation;
 - `already_billed` and relevant provider-history matching;
@@ -52,11 +53,17 @@ Verified cases:
 - history-source failure produces zero charge calls;
 - no unintended charge is produced by invalid or already-billed rows.
 
+## Account preflight gate
+
+The live Module→Workflow binding for `account_preflight` passed with Stripe TEST provider reads. The `account_preflight` node resolves `stripe_billing_account_preflight` after `dedup` and before `plan_summary`; its output is normalized from the effect wrapper and matched one-to-one with candidate customer IDs.
+
+The gate passes only `ok: true`, `billing_state: "ready"`, complete evidence, valid UTC `as_of`, and evidence within the configured freshness bound. Missing, stale, incomplete, truncated, refused, malformed, or ambiguous evidence fails closed before planning and therefore before `charge`. This is read-only readiness evidence, not approval, Airlock authority, plan pinning, or an execution guard.
+
 ## Incremental history
 
 `invoice_history` resolves through the module's `stripe_billing_invoice_list` action. Station owns `since`, `exclude_invoice_ids`, cursor, seen-window, and watermark state. The workflow contains no local cursor or hardcoded `since`.
 
-The v1.7 runtime binding reads the flattened effect wrapper's list from:
+The v1.8 runtime binding reads the flattened effect wrapper's list from:
 
 ```text
 {{nodes.invoice_history._}}
@@ -70,9 +77,13 @@ Verified behavior:
 - failed, truncated, manual, and unresolved runs hold schedule-owned watermark advancement;
 - schedule overlap uses `skip` rather than concurrent duplicate work.
 
+The workflow's `history_provenance` is limited to source action/command, Station incremental ownership, `since`, returned count, `skipped_already_delivered`, history matches considered, suppression count, `truncated`, and `completeness`. It does not fabricate a snapshot hash, receipt reference, watermark before/after, or observation-window end. Runtime provenance is not static plan identity and does not cause static plan-root drift.
+
 ## Plan, execution guard, and spend
 
 `plan_summary`, `review_summary`, and `approval_tier` produce a reviewable plan and required approval tier. `execution_guard` requires a valid readiness/approval condition and matching approved plan identity. A wrong hash or blocking review condition stops the workflow before `charge` and is not reported as a completed run.
+
+The static plan binds billing period, project `billing_run_id`, candidate identity, amounts, descriptions, totals, and plan identity. Project `billing_run_id` does not replace Station's `run_id`; a changed financial plan cannot reuse an approval for a different plan.
 
 Controlled spend-cap verification covered the three important boundaries:
 
@@ -102,9 +113,13 @@ The advisory path uses `advisory_switch` and `anomaly_payload` with minimized fa
 
 No native provider success is inferred from advisory fixtures or controlled harness output.
 
+Advisory output cannot approve, bypass the execution guard, change an `unknown` outcome to `landed`, or raise the spend ceiling. No current live AI success is claimed.
+
 ## Receipts and provenance
 
 Workflow receipts and integrity evidence were checked where produced by the verified paths. Provider success is claimed only when a provider receipt or effect supports it. Controlled effect fan-out and recovery tests use harmless harness/provider stubs; they are not production financial writes.
+
+The latest Step 4 verification performed no financial write and generated no live signed workflow receipt. That limitation is explicit; controlled receipts are not presented as live-money evidence.
 
 No secret, credential, approval token, production customer data, private path, or signing material belongs in this report.
 
@@ -114,4 +129,4 @@ Native multi-member Team quorum was **not exercised** because the local environm
 
 ## Conclusion
 
-Workflow v1.7.0 is verified with five legacy canvas nodes and exactly 13 engine nodes. Validation, history-aware deduplication, fail-closed truncation handling, deterministic plan/guard binding, spend-cap boundaries, approval-controlled charge fan-out, reconcile/recovery/settle semantics, and advisory isolation passed. The only stated verification limitation is the unavailable second identity for native multi-member Team quorum.
+Workflow v1.8.0 is verified with five legacy canvas nodes and exactly 14 engine nodes. Validation, history-aware deduplication, account-preflight gating, fail-closed truncation handling, deterministic plan/guard binding, spend-cap boundaries, approval-controlled charge fan-out, reconcile/recovery/settle semantics, and advisory isolation passed. The only stated verification limitation is the unavailable second identity for native multi-member Team quorum.
