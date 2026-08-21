@@ -1,200 +1,230 @@
 # Retainer Billing Run
 
-A billing export is not proof that a customer should be billed. Recurring data can contain the same customer twice, a customer may already have been billed in another run, provider history may be incomplete, and a timeout can leave the result uncertain after an effect lands.
+`dave/retainer-billing-run` v1.9.0 is a governed workflow for recurring
+retainer billing. It addresses a practical failure mode for small teams,
+consultants, and agencies: the same client can appear twice in an export, a
+previous invoice may already exist, provider history may be incomplete, and a
+timeout can leave a billing effect unresolved. The workflow prepares and
+reviews a plan before money movement, then reconciles the result against what
+the provider actually reports.
 
-`dave/retainer-billing-run` v1.8.0 turns that input into a stateful billing run that decides whether billing is safe to continue. It combines validation, incremental provider history, duplicate suppression, account readiness, deterministic planning, approval and execution guards, spend controls, reconciliation/recovery, and settlement while keeping advisory output isolated from financial authority.
+## What it solves
 
-Demo: https://youtu.be/x79XvHJK-_M
+The workflow separates validation, history-aware deduplication, account
+readiness, planning, approval, execution, reconciliation, recovery, and
+settlement. Duplicate input rows and already-billed identities are skipped.
+Incomplete history is not treated as proof that billing is safe. A plan is
+bound to its billing period, project `billing_run_id`, candidates, amounts,
+descriptions, and plan hash. Execution must receive the matching approved plan
+identity. If the provider outcome is unknown, the workflow preserves that
+uncertainty and does not blindly retry it.
 
-Dependency declared by the current `workflow/spec.json`: `dave/stripe-invoicing >= 1.5.0`. The current module implementation is `dave/stripe-invoicing` v1.5.0 with 34 commands; the earlier cycle baseline was v1.4.0.
+## Prerequisites
 
-## How the workflow works
-
-```text
-INPUT → HISTORY → PREFLIGHT → PLAN / GUARD → MONEY → RECONCILE / RECOVERY → SETTLE
-```
-
-- **INPUT** rejects malformed rows and unsafe amounts.
-- **HISTORY** reads incremental invoice history and checks whether a candidate was already billed.
-- **PREFLIGHT** checks bounded, read-only Stripe account readiness before planning can continue.
-- **PLAN / GUARD** builds a deterministic plan, explains review findings, selects an approval tier, and binds execution to the approved plan identity.
-- **MONEY** sends only clean candidates to the module's approval-controlled billing action.
-- **RECONCILE / RECOVERY** separates landed, failed, skipped, and unknown outcomes and keeps uncertain work from being retried blindly.
-- **SETTLE** advances the run only when unresolved provider truth does not require a hold.
-- Optional **ADVISORY** nodes add minimized anomaly context but never become financial authority.
-
-## The 14-node runtime architecture
-
-The source retains a five-node legacy canvas for compatibility. The authoritative runtime graph is the following **14-node `engine_spec`**:
-
-| Node | Purpose | Important behavior |
-|---|---|---|
-| `validate` | Normalize `ctx.clients` and reject malformed rows. | Requires a non-empty identity and positive whole-integer `amount_cents`; invalid rows do not reach `charge`. |
-| `invoice_history` | Read provider invoice history. | Resolves through the module's `stripe_billing_invoice_list`; Station supplies incremental state. |
-| `dedup` | Remove duplicate and already-billed candidates. | Reads the flattened history list from `{{nodes.invoice_history._}}`; matching retainer history is labeled `stripe_history_same_period`. |
-| `account_preflight` | Check each candidate's bounded Stripe billing readiness. | Resolves the read-only `stripe_billing_account_preflight` action; it is evidence for planning, not approval or authority. |
-| `plan_summary` | Create the deterministic billing plan. | Produces candidates, total, count, period, `billing_run_id`, and plan hash. |
-| `review_summary` | Explain review and anomaly findings. | Adds reasons for review without authorizing a charge. |
-| `approval_tier` | Calculate the required approval tier. | Reports the required quorum/tier; Station remains the approval authority. |
-| `execution_guard` | Check whether execution is ready. | Fails closed when readiness, review, or approved plan identity is missing or invalid. |
-| `advisory_switch` | Keep optional advisory availability explicit. | Disabled/unavailable advisory cannot authorize billing. |
-| `anomaly_payload` | Build minimized advisory input. | Contains only the facts needed for anomaly analysis. |
-| `charge` | Fan out clean candidates. | Resolves through `stripe_billing_bill_client`, an approval-controlled module action. |
-| `reconcile` | Compare intended work with provider results. | Preserves landed and unresolved outcomes instead of inventing success. |
-| `recovery_plan` | Build a conservative recovery set. | Uses provider truth and does not retry an effect known to have landed. |
-| `settle` | Decide whether the run is settled. | Unresolved outcomes keep settlement and watermark advancement on hold. |
-
-The critical gate is deliberately ordered as:
+The exact dependency is:
 
 ```text
-dedup → account_preflight → plan_summary
+dave/stripe-invoicing >= 1.6.0
 ```
 
-`account_preflight` may only pass a candidate into planning when its provider evidence is `ready`, complete, has a valid `as_of`, and is not stale, refused, malformed, truncated, or otherwise unknown. A preflight pass is not an approval, an Airlock decision, a plan pin, or an execution guard; those controls remain separate.
+Install and configure the Module through Station. The Workflow does not own or
+store a Stripe secret. A buyer configures the Module's canonical structured
+credential field `STRIPE_SECRET_KEY` through Station Configure. Existing
+pre-v1.6.0 buyers may need the Module's one-time explicit Configure migration;
+plain legacy credentials are not transparently migrated. Do not put secrets in
+Workflow context. The Workflow declares Stripe and Groq capabilities, a
+`max_spend_cents` of `50000`, and `allow_irreversible: true`; the actual money
+effect remains the Module action behind Station approval.
 
-The final history binding is deliberate:
+## Input contract
 
-```text
-dedup.input_from.invoice_history = {{nodes.invoice_history._}}
-```
+The authoritative runtime context is `engine_spec.context` in `spec.json`.
+Important fields are:
 
-## Install and prepare a safe first plan
+| Field | Shape and purpose |
+|---|---|
+| `clients` | Array of objects with `email`, optional `customer_id`, and positive whole-integer `amount_cents`; invalid rows are rejected. |
+| `already_billed` | Array of identities already billed for the run; matching identities are skipped. |
+| `billing_period` | String such as `2026-08`; used for deterministic description/history matching. |
+| `billing_run_id` | Project correlation string; it is not Station's `run_id`. |
+| `approved_plan_hash` | String supplied by the approval/execution path; a non-matching value blocks execution. |
+| `spend_ceiling_cents` | Integer ceiling for the run; current context defaults to `50000`. |
+| `approval_tiers` | Object containing `small_batch_max_cents`, `small_batch_quorum`, and `large_batch_quorum`. |
+| `anomaly_config` | Object containing the configured batch/amount thresholds used by review analysis. |
+| `known_customer_emails`, `prior_amount_by_email`, `prior_customer_ids` | Optional review context used by `review_summary`; these do not authorize money movement. |
+| `enable_anomaly_advisory` | Advisory request flag; advisory remains isolated from execution authority. |
+| `operator_declared_groq_credential_available` | Operator declaration used by the advisory switch; it does not create a credential. |
+| `portfolio_baseline_cents` | Numeric baseline passed to the minimized advisory payload. |
+| `preflight_max_age_seconds` | Optional integer freshness bound, 60–86,400 seconds; current default is 900. |
+| `preflight_reference_time` | Optional UTC timestamp used to evaluate preflight age; empty means same-run evidence. |
 
-Install the dependency and workflow through the current marketplace command:
-
-```sh
-railcall market install dave/stripe-invoicing
-railcall market install dave/retainer-billing-run
-```
-
-Then open the workflow in Studio and prepare a plan. Configure a Stripe **TEST** credential in the Station vault through Studio's Stripe integration; do not put a secret in workflow context.
-
-Use a minimal context like this as a starting point:
+Example input shape, not execution output:
 
 ```json
 {
-  "clients": [
-    {
-      "email": "billing-contact@example.test",
-      "customer_id": "cus_test_only",
-      "amount_cents": 700
-    }
-  ],
-  "billing_period": "2026-08",
+  "clients": [{"email": "billing@example.test", "customer_id": "cus_test", "amount_cents": 700}],
   "already_billed": [],
+  "billing_period": "2026-08",
   "billing_run_id": "retainer-2026-08-001",
+  "approved_plan_hash": "",
   "spend_ceiling_cents": 1000
 }
 ```
 
-Before the first run, change:
+## 14-node lifecycle
 
-- `clients`: the rows to consider; each billable row needs an identity and a positive whole-integer amount in cents;
-- `billing_period`: the period used in the deterministic retainer description and history match;
-- `already_billed`: operator-known billed identities for this run;
-- `billing_run_id`: your project correlation ID, not Station's `run_id`;
-- `spend_ceiling_cents`: the permitted cumulative amount for the run.
-- `preflight_max_age_seconds`: optional freshness bound for preflight evidence (the current default is 900 seconds; the workflow accepts 60–86,400 seconds).
-- `preflight_reference_time`: optional UTC reference used for a bounded freshness check; leave it empty for same-run evidence.
+The following is an explanatory grouping of the authoritative
+`engine_spec.nodes` order. It is not a second runtime graph. The top-level
+five-node `nodes` array is a secondary, high-level canvas representation; it
+is not authoritative runtime behavior. The 14-node `engine_spec.nodes` array
+is the authoritative runtime graph verified by the tests. Its declared order
+is intentional, and `engine_spec.edges` is intentionally empty: Station uses
+the node order plus each node's `parent`, `cond`, `input_from`, and `for_each`
+bindings rather than a separate edge-list DAG.
 
-Leave `approved_plan_hash` empty until the Station approval flow supplies it. Optional review, approval-tier, schedule, and advisory fields can remain at their documented defaults. Start with the plan/dry-run surface, inspect what is billable and skipped, then review the plan hash, approval tier, and spend ceiling before any money-moving approval.
+### PREPARE
 
-Station owns incremental `since`, `exclude_invoice_ids`, cursor, and watermark state. Do not create a local cursor or manually advance a watermark in workflow context.
+1. **`validate` — `transform`**: reads `ctx.clients`, normalizes email and
+   customer identity, accepts positive integer cents, and records rejected
+   rows. It cannot move money.
+2. **`invoice_history` — `effect`**: resolves
+   `stripe_billing_invoice_list` through Stripe with `limit: 100`. Station
+   supplies incremental state; this is a read and cannot move money.
+3. **`dedup` — `transform`**: combines validated rows, Station's flattened
+   history output, `already_billed`, and the period. It removes duplicate
+   export rows and relevant same-period retainer invoices, and emits history
+   provenance. It cannot move money.
+4. **`account_preflight` — `effect`**: fans out
+   `stripe_billing_account_preflight` for each clean candidate. It is a
+   read-only readiness check and cannot move money.
+5. **`plan_summary` — `transform`**: validates preflight records, checks
+   freshness/completeness, builds candidates and totals, and computes the
+   deterministic plan identity. It cannot move money.
 
-### History provenance
+### REVIEW / APPROVE / EXECUTE
 
-The workflow exposes only provenance fields actually supplied by the incremental source and transform:
+6. **`review_summary` — `transform`**: applies the configured review/anomaly
+   rules and prior-customer context to the plan. Findings are advisory review
+   information, not financial authority.
+7. **`approval_tier` — `transform`**: calculates the required tier/quorum from
+   the plan and `approval_tiers`. It reports a requirement; Station remains the
+   approval authority.
+8. **`execution_guard` — `transform`**: checks the review/approval conditions
+   and supplied `approved_plan_hash`. A failed or mismatched guard blocks the
+   effect and is not a completed run.
+9. **`advisory_switch` — `transform`**: evaluates whether optional Groq
+   advisory processing was requested and declared available. It cannot approve
+   or authorize billing.
+10. **`anomaly_payload` — `transform`**: builds minimized advisory input from
+    planned candidates, period, and portfolio baseline. It cannot move money.
 
-- `source_action_id` and `source_command`;
-- `station_incremental` and `cursor_owner`;
-- Station-injected `since`;
-- `returned_count`;
-- `skipped_already_delivered`;
-- `history_matches_considered`;
-- `stripe_history_suppressed_count`;
-- `truncated` and `completeness`.
+### MONEY / RECONCILE / RECOVER / SETTLE
 
-Station remains the owner of `since` injection, watermark, seen state, and incremental settlement. The workflow does not create a `snapshot_hash`, receipt reference, watermark before/after, or observation-window end. Runtime provenance is evidence about this run; it is not the static plan identity or `plan_hash`.
+11. **`charge` — `effect`**: fans out planned candidates to the actual action
+    `stripe_billing_bill_client`. It is the only Workflow node with a direct
+    financial effect and is still protected by Module/Station approval. The
+    node declares retry metadata (`max: 3`, `backoff_s: 2`); an unknown
+    provider result is not thereby safe to retry.
+12. **`reconcile` — `transform`**: compares planned intent with charge results
+    and preserves landed, failed, and unknown/unresolved classifications where
+    present.
+13. **`recovery_plan` — `transform`**: builds a conservative recovery set from
+    reconciliation. It does not claim compensation and does not blindly retry
+    an effect known to have landed.
+14. **`settle` — `transform`**: determines settlement and watermark readiness
+    from reconciliation and recovery. Unresolved outcomes hold settlement and
+    watermark advancement.
 
-The `account_preflight` gate applies the same fail-closed principle. A missing, stale, incomplete, truncated, refused, malformed, or ambiguous result stops planning before a financial effect. `as_of` is provider evidence time in UTC; a supplied `preflight_reference_time` bounds its age, and otherwise the evidence is treated as same-run.
+## Incremental history and provenance
 
-## History-aware deduplication
+Station owns the cursor, `since`, seen state, and watermark. The Workflow does
+not create a local cursor or hardcode a `since` value. `dedup` reads the
+flattened history result from `{{nodes.invoice_history._}}`, applies the
+relevant period/description/status/amount match, and records provenance such
+as source action, source command, Station ownership, `since`, returned count,
+skipped delivered count, matches considered, suppression count, truncation,
+and completeness. A truncated or incomplete history result fails closed for
+safe billing decisions; it is not evidence that an invoice does not exist.
+Runtime provenance describes the run and does not alter static plan identity.
 
-This is more than removing duplicate CSV rows. The workflow protects against both `duplicate_in_export` and `already_billed_this_period` by combining input checks with provider invoice history.
+## Account preflight
 
-The candidate description is deterministic:
+`account_preflight` is a read-only provider check before planning. The plan
+gate requires one valid record per candidate, `ok: true`, `billing_state:
+"ready"`, complete evidence, a valid UTC `as_of`, and acceptable freshness.
+Attention-required, not-ready, unknown, stale, refused, malformed, truncated,
+ambiguous, or mismatched records block planning before `charge`. A preflight
+pass is readiness evidence only; it is not approval, an Airlock decision, a
+plan pin, or financial authority.
 
-```text
-Retainer billing for <billing_period>
-```
+## Deterministic planning and plan binding
 
-A provider invoice is relevant only when the client, billing period, amount, status, and this description match. A relevant match is skipped with `stripe_history_same_period`. An unrelated one-off invoice does not suppress the candidate.
+`plan_summary` constructs candidate identity, amount, currency, description,
+period, project billing run, candidate count, and total planned cents. It
+computes the plan hash from the canonical plan representation. The exact
+approved plan hash is supplied to `execution_guard`; a changed plan or wrong
+hash cannot silently reuse approval. Station's signed plan/receipt remains the
+runtime authority for approval evidence. `billing_run_id` is project
+correlation only and never replaces Station's `run_id`.
 
-Station injects incremental history state and may provide `exclude_invoice_ids`. Complete history is usable; `truncated: true` means the history is incomplete and the workflow fails closed. It never interprets incomplete history as evidence that a customer has not been billed. A history-source failure also stops the path before `charge`.
+## Approval, spend cap, and execution
 
-## Plan and execution guard
+Station controls approval, quorum, Airlock state, receipts, and execution
+authorization. The Workflow declares `max_spend_cents: 50000` and
+`allow_irreversible: true`; the latter permits the declared effect to exist but
+does not bypass approval. A cap or guard failure blocks the next effect before
+the cap is exceeded. A previously landed effect is not automatically refunded
+or rolled back by this Workflow. Planned, approved, attempted, and landed are
+distinct states where the runtime/provider result supports that distinction.
 
-Clean candidates do not immediately reach `charge`:
+## Reconciliation, recovery, and settlement
 
-1. `plan_summary` creates the deterministic plan and hash.
-2. `review_summary` records explainable review/anomaly findings.
-3. `approval_tier` calculates the required tier without fabricating an approval.
-4. `execution_guard` checks readiness and that the supplied approved plan identity still matches the plan being executed.
+Reconciliation uses provider/action results rather than local optimism. A
+landed result is preserved as landed; a provider refusal can be failed; and an
+ambiguous timeout remains unknown/unresolved. Recovery keeps known-landed work
+out of an unsafe retry set and may require operator/provider confirmation. The
+Workflow does not promise automatic Stripe compensation or automatic retry of
+unknown effects. Settlement and watermark advancement remain held until the
+unresolved state is resolved according to Station's state contract.
 
-The plan binds `billing_period`, project `billing_run_id`, candidate identity, amounts, descriptions, totals, and the plan identity. Project `billing_run_id` is a correlation field; it does not replace Station's `run_id`. A changed financial plan cannot silently reuse an approval for a different plan.
+## Advisory isolation
 
-The guard fails closed for incomplete or invalid execution conditions. During verification, a blocked guard could previously coexist with a completed workflow state; the final behavior stops execution and reports the block truthfully instead.
+Groq advisory processing is optional and minimized. `advisory_switch` and
+`anomaly_payload` do not approve, charge, change Stripe state, bypass the
+execution guard, change unknown to landed, or raise the spend cap. Missing
+advisory credentials or invalid advisory output cannot authorize billing.
 
-## Spend ceiling
+## Failure behavior
 
-The ceiling is enforced before the next effect would exceed the permitted amount. Verified boundary examples:
-
-- 700 cents with a 699-cent cap: blocked before charge;
-- 700 cents with a 700-cent cap: allowed;
-- a 1,100-cent batch with a 1,000-cent cap: an under-cap item may land, then the next effect is blocked before the ceiling is exceeded.
-
-If an effect already landed, a spend-cap rollback state does **not** mean Stripe automatically refunded or reversed it. Reconcile and recovery must use provider truth.
-
-`charge` still resolves through `stripe_billing_bill_client`. Writes remain approval-controlled by the Module and Station, and the spend ceiling is enforced before the next effect would exceed it. A passing account preflight is readiness evidence only; it is not an approval or financial authority.
-
-## Reconcile, recovery, and settlement
-
-`reconcile` distinguishes intended billing from what the provider actually reported. An attempted effect can be `landed` or `unknown/unresolved`; `unknown` is not the same as `failed`.
-
-For the verified mixed-result case:
-
-- the landed result is preserved;
-- the unknown result and unresolved amount are preserved;
-- `safe_to_retry` is `false`;
-- the watermark action is held;
-- settlement remains unresolved;
-- `recovery_plan` is required before a safe retry decision.
-
-If RailCall cannot prove whether an effect landed, the workflow does not blindly retry it. This prevents uncertainty from becoming duplicate billing. The workflow does not claim automatic Stripe compensation.
-
-## Advisory boundary
-
-`advisory_switch` and `anomaly_payload` are optional, minimized, and separate from deterministic financial authority. Advisory failure or unavailability cannot silently authorize a charge, and advisory output is not treated as provider success.
-
-Advisory output cannot approve, bypass the execution guard, change `unknown` to `landed`, or raise the spend ceiling. No live AI/provider-success claim is made here unless a current receipt supports it.
-
-## Team approval limitation
-
-Native multi-member Team quorum was **not exercised** in the local verification environment because it requires a second independent Station identity. This is a test-environment limitation, not a workflow defect, and this documentation makes no native quorum E2E claim.
+| Failure | Workflow behavior |
+|---|---|
+| Invalid row or amount | Rejects the row before planning/effect. |
+| Duplicate export row | Skips it as `duplicate_in_export`. |
+| Already billed identity | Skips it as `already_billed_this_period`. |
+| Relevant provider history | Skips it as `stripe_history_same_period`. |
+| History failure/truncation | Fails closed; no charge is allowed from incomplete history. |
+| Preflight not ready/stale/malformed | Planning gate refuses; no charge. |
+| Cap exceeded | Blocks the next effect before exceeding the declared ceiling. |
+| Approval/hash missing or mismatched | Execution guard blocks; not completed. |
+| Provider refusal | Reconciliation can classify the result as failed. |
+| Ambiguous provider outcome | Preserved as unknown/unresolved; unsafe retry is not implied. |
+| Recovery unresolved | Settlement and watermark advancement remain held. |
 
 ## Known limitations
 
-### Project limitations
+The dependency must resolve to Module v1.6.0 or later. Stripe credentials belong
+to Station/Module Configure, not Workflow context. TEST/fixture and harness
+evidence is not production-money proof. Provider state, permissions, latency,
+and usage/history completeness remain environmental. Unknown effects require
+conservative recovery and may require operator confirmation. The declared
+retry metadata does not make unknown effects safe to retry. Native multi-member
+Team quorum was not exercised locally because a second independent Station
+identity was unavailable. The Workflow has no automatic compensation claim.
 
-- Provider success is claimed only when an actual receipt or effect supports it.
-- Strict preflight can hold planning when readiness evidence is incomplete, stale, truncated, refused, or unknown; bounded provider reads can therefore produce an `unknown` decision.
-- Unknown provider outcomes require conservative recovery and may need operator/provider confirmation before retry.
-- An unknown outcome is not automatically safe to retry; `safe_to_retry` remains false until provider truth is sufficient.
-- Station owns incremental state, overlap behavior, and watermark settlement; the workflow does not replace those controls.
-- The latest verification performed no financial write and generated no live signed workflow receipt.
+## Evidence
 
-### Test-environment limitation
-
-- Native multi-member Team quorum was not exercised locally because a second independent Station identity was unavailable.
-
-For the final verification matrix, see [TESTING.md](TESTING.md).
+- Homepage: https://davelab10.github.io/portofolio/
+- Tests: https://github.com/davelab10/railcall-retainer-billing-run/blob/main/TESTING.md
+- Current public video: https://youtu.be/wXJn9yWTTn8
+- Any v1.8.0 public video is historical evidence only and is not the current
+  Workflow release.
