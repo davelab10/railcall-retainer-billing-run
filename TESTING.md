@@ -1,11 +1,11 @@
-# Workflow testing and reviewer evidence — v1.9.0
+# Workflow testing and reviewer evidence — v1.9.1
 
-This is an evidence report for `dave/retainer-billing-run` v1.9.0. It
+This is an evidence report for `dave/retainer-billing-run` v1.9.1. It
 separates automated/fixture proof from live financial claims.
 
 ## Tested baseline
 
-- Workflow: `dave/retainer-billing-run` v1.9.0
+- Workflow: `dave/retainer-billing-run` v1.9.1
 - Engine graph: 14 authoritative nodes
 - Dependency: `dave/stripe-invoicing >= 1.6.0`
 - Station baseline: v1.5.0
@@ -71,7 +71,7 @@ dave/stripe-invoicing >= 1.6.0
 Tests resolve the current Module command surface for invoice history,
 account preflight, and billing execution. The Workflow does not carry the
 Stripe secret; Station/Module Configure owns credential resolution, with the
-Module v1.6.0 canonical `STRIPE_SECRET_KEY` contract.
+Module v1.6.1 canonical `STRIPE_SECRET_KEY` contract.
 
 ## Incremental history and provenance
 
@@ -137,7 +137,7 @@ automatic retry.
 
 ## Public video
 
-Current public Workflow video: https://youtu.be/wXJn9yWTTn8
+Current public Workflow video: https://youtu.be/ugNt-j2-B8w
 
 The video demonstrates the documented workflow structure and governance
 boundaries; it is not proof of production-money execution or live provider
@@ -166,7 +166,7 @@ The canonical active Station workflow was synchronized to:
 dave_retainer-billing-run.json
 ```
 
-It is v1.9.0 with 14 engine nodes and dependency `dave/stripe-invoicing >=
+It is v1.9.1 with 14 engine nodes and dependency `dave/stripe-invoicing >=
 1.6.0`. Any older workflow artifact found outside the active loader path is
 NON-ACTIVE and must not be interpreted as current runtime state.
 

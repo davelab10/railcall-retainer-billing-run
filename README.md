@@ -1,6 +1,6 @@
 # Retainer Billing Run
 
-`dave/retainer-billing-run` v1.9.0 is a governed workflow for recurring
+`dave/retainer-billing-run` v1.9.1 is a governed workflow for recurring
 retainer billing. It addresses a practical failure mode for small teams,
 consultants, and agencies: the same client can appear twice in an export, a
 previous invoice may already exist, provider history may be incomplete, and a
@@ -225,6 +225,6 @@ identity was unavailable. The Workflow has no automatic compensation claim.
 
 - Homepage: https://davelab10.github.io/portofolio/
 - Tests: https://github.com/davelab10/railcall-retainer-billing-run/blob/main/TESTING.md
-- Current public video: https://youtu.be/wXJn9yWTTn8
+- Current public video: https://youtu.be/ugNt-j2-B8w
 - Any v1.8.0 public video is historical evidence only and is not the current
   Workflow release.
